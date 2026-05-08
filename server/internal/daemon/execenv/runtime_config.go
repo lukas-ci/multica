@@ -5,15 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
-
-// runtimeGOOS is the host-platform string used by buildMetaSkillContent to
-// emit Windows-specific guidance. Defaults to runtime.GOOS; tests override
-// it to exercise the cross-platform branches deterministically without
-// having to run on every target OS.
-var runtimeGOOS = runtime.GOOS
 
 // formatProjectResource renders a single resource as a human-readable bullet.
 // Unknown resource types fall back to a JSON-encoded ref so the agent can
@@ -139,38 +132,18 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 	b.WriteString("- `multica issue label remove <issue-id> <label-id>` — Detach a label from an issue\n")
 	b.WriteString("- `multica issue subscriber add <issue-id> [--user <name>|--user-id <uuid>]` — Subscribe a member or agent to issue updates (defaults to the caller when neither flag is set; the two flags are mutually exclusive)\n")
 	b.WriteString("- `multica issue subscriber remove <issue-id> [--user <name>|--user-id <uuid>]` — Unsubscribe a member or agent\n")
-	if runtimeGOOS == "windows" {
-		// Windows shells (PowerShell 5.1, cmd.exe) re-encode piped HEREDOC
-		// bytes through the active console codepage before they reach
-		// `multica.exe`, silently replacing characters the codepage cannot
-		// represent with `?`. Steer the agent at `--content-file` /
-		// `--description-file` from the start so there is no contradicting
-		// "MUST pipe via stdin" line for the agent to latch onto. See
-		// issues #2198 / #2236.
-		b.WriteString("- `multica issue comment add <issue-id> --content-file <path> [--parent <comment-id>] [--attachment <path>]` — Post a comment. **On this Windows host, write the body to a UTF-8 file with your file-write tool first, then pass the path via `--content-file` — do NOT pipe via `--content-stdin`.** PowerShell 5.1 and `cmd.exe` re-encode piped bytes through the active console codepage and silently drop non-ASCII characters as `?`, so `中文` arrives as `??`. Use `--parent` to reply to a specific comment; `--attachment` may be repeated.\n")
-		b.WriteString("  - **For comment content, write a UTF-8 file then pass `--content-file <path>`; this preserves multi-line content and non-ASCII bytes (Chinese, Japanese, accents, emoji) verbatim.** Do not use inline `--content` and do not write `\\n` escapes. Example:\n")
-		b.WriteString("\n")
-		b.WriteString("    ```\n")
-		b.WriteString("    # 1. Write the comment body to a UTF-8 file using your file-write tool.\n")
-		b.WriteString("    # 2. Then run:\n")
-		b.WriteString("    multica issue comment add <issue-id> --content-file ./comment.md\n")
-		b.WriteString("    ```\n")
-		b.WriteString("\n")
-		b.WriteString("  - The same rule applies to `--description` on `multica issue create` and `multica issue update` — write the body to a UTF-8 file with your file-write tool and pass `--description-file <path>`. The inline `--description \"...\"` form is acceptable only for ASCII-only single-line text. Do NOT use `--description-stdin` on this host.\n")
-	} else {
-		b.WriteString("- `multica issue comment add <issue-id> --content-stdin [--parent <comment-id>] [--attachment <path>]` — Post a comment. Agent-authored comments should always pipe content via stdin, even for short single-line replies. Use `--parent` to reply to a specific comment; `--attachment` may be repeated.\n")
-		b.WriteString("  - **For comment content, you MUST pipe via stdin; this is mandatory for multi-line content (anything with line breaks, paragraphs, code blocks, backticks, or quotes).** Do not use inline `--content` and do not write `\\n` escapes. Use a HEREDOC instead:\n")
-		b.WriteString("\n")
-		b.WriteString("    ```\n")
-		b.WriteString("    cat <<'COMMENT' | multica issue comment add <issue-id> --content-stdin\n")
-		b.WriteString("    First paragraph.\n")
-		b.WriteString("\n")
-		b.WriteString("    Second paragraph with `code` and \"quotes\".\n")
-		b.WriteString("    COMMENT\n")
-		b.WriteString("    ```\n")
-		b.WriteString("\n")
-		b.WriteString("  - The same rule applies to `--description` on `multica issue create` and `multica issue update` — use `--description-stdin` and pipe a HEREDOC for any multi-line description; the inline `--description \"...\"` form is for short single-line text only.\n")
-	}
+	b.WriteString("- `multica issue comment add <issue-id> --content-stdin [--parent <comment-id>] [--attachment <path>]` — Post a comment. Agent-authored comments should always pipe content via stdin, even for short single-line replies. Use `--parent` to reply to a specific comment; `--attachment` may be repeated.\n")
+	b.WriteString("  - **For comment content, you MUST pipe via stdin; this is mandatory for multi-line content (anything with line breaks, paragraphs, code blocks, backticks, or quotes).** Do not use inline `--content` and do not write `\\n` escapes. Use a HEREDOC instead:\n")
+	b.WriteString("\n")
+	b.WriteString("    ```\n")
+	b.WriteString("    cat <<'COMMENT' | multica issue comment add <issue-id> --content-stdin\n")
+	b.WriteString("    First paragraph.\n")
+	b.WriteString("\n")
+	b.WriteString("    Second paragraph with `code` and \"quotes\".\n")
+	b.WriteString("    COMMENT\n")
+	b.WriteString("    ```\n")
+	b.WriteString("\n")
+	b.WriteString("  - The same rule applies to `--description` on `multica issue create` and `multica issue update` — use `--description-stdin` and pipe a HEREDOC for any multi-line description; the inline `--description \"...\"` form is for short single-line text only.\n")
 	b.WriteString("- `multica issue comment delete <comment-id>` — Delete a comment\n")
 	b.WriteString("- `multica label create --name \"...\" --color \"#hex\"` — Define a new workspace label (use this only when the label you need does not exist yet; reuse existing labels via `multica label list` first)\n")
 	b.WriteString("- `multica autopilot create --title \"...\" --agent <name> --mode create_issue [--description \"...\"]` — Create an autopilot\n")
@@ -180,15 +153,9 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 
 	if provider == "codex" {
 		b.WriteString("## Codex-Specific Comment Formatting\n\n")
-		if runtimeGOOS == "windows" {
-			b.WriteString("Codex often follows the per-turn reply command literally. On Windows, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`** — do NOT pipe via `--content-stdin`. PowerShell 5.1 / cmd.exe re-encode piped bytes through the active console codepage and silently drop non-ASCII characters as `?`. Never use inline `--content` for agent-authored comments. ")
-			b.WriteString("Keep the same `--parent` value from the trigger comment when replying. ")
-			b.WriteString("Do not compress a multi-paragraph answer into one line and do not rely on `\\n` escapes.\n\n")
-		} else {
-			b.WriteString("Codex often follows the per-turn reply command literally. For issue comments, always use `--content-stdin` with a HEREDOC, even for short single-line replies. ")
-			b.WriteString("Never use inline `--content` for agent-authored comments. Keep the same `--parent` value from the trigger comment when replying. ")
-			b.WriteString("Do not compress a multi-paragraph answer into one line and do not rely on `\\n` escapes.\n\n")
-		}
+		b.WriteString("Codex often follows the per-turn reply command literally. For issue comments, always use `--content-stdin` with a HEREDOC, even for short single-line replies. ")
+		b.WriteString("Never use inline `--content` for agent-authored comments. Keep the same `--parent` value from the trigger comment when replying. ")
+		b.WriteString("Do not compress a multi-paragraph answer into one line and do not rely on `\\n` escapes.\n\n")
 	}
 
 	// Inject available repositories section.
