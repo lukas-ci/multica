@@ -481,6 +481,21 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate every field that's present BEFORE running any mutation. A
+	// PATCH that carries both `timezone` and `visibility` must succeed or
+	// fail atomically from the caller's perspective: writing timezone first
+	// and then 400-ing on a bad visibility would leave the row half-updated
+	// (and the usage rollup rebuilt under a tz the caller never asked for).
+	//
+	// This loop also fixes the no-op short-circuit: the prior version
+	// returned early when `timezone == rt.Timezone`, silently dropping a
+	// concurrent visibility patch in the same request body.
+	var (
+		newTimezone    string
+		needTimezone   bool
+		newVisibility  string
+		needVisibility bool
+	)
 	if req.Timezone != nil {
 		tz := *req.Timezone
 		if tz == "" {
@@ -490,12 +505,24 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid IANA timezone")
 			return
 		}
-
-		if tz == rt.Timezone {
-			writeJSON(w, http.StatusOK, runtimeToResponse(rt))
+		if tz != rt.Timezone {
+			newTimezone = tz
+			needTimezone = true
+		}
+	}
+	if req.Visibility != nil {
+		v := *req.Visibility
+		if v != "private" && v != "public" {
+			writeError(w, http.StatusBadRequest, "visibility must be 'private' or 'public'")
 			return
 		}
+		if v != rt.Visibility {
+			newVisibility = v
+			needVisibility = true
+		}
+	}
 
+	if needTimezone {
 		tx, err := h.TxStarter.Begin(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to update runtime")
@@ -511,7 +538,7 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		}
 		updated, err := qtx.UpdateAgentRuntimeTimezone(r.Context(), db.UpdateAgentRuntimeTimezoneParams{
 			ID:       runtimeUUID,
-			Timezone: tz,
+			Timezone: newTimezone,
 		})
 		if err != nil {
 			slog.Error("UpdateAgentRuntimeTimezone failed", "error", err, "runtime_id", runtimeID)
@@ -541,30 +568,23 @@ func (h *Handler) UpdateAgentRuntime(w http.ResponseWriter, r *http.Request) {
 		rt = updated
 	}
 
-	if req.Visibility != nil {
-		v := *req.Visibility
-		if v != "private" && v != "public" {
-			writeError(w, http.StatusBadRequest, "visibility must be 'private' or 'public'")
+	if needVisibility {
+		updated, err := h.Queries.UpdateAgentRuntimeVisibility(r.Context(), db.UpdateAgentRuntimeVisibilityParams{
+			ID:         runtimeUUID,
+			Visibility: newVisibility,
+		})
+		if err != nil {
+			slog.Error("UpdateAgentRuntimeVisibility failed", "error", err, "runtime_id", runtimeID)
+			writeError(w, http.StatusInternalServerError, "failed to update runtime")
 			return
 		}
-		if v != rt.Visibility {
-			updated, err := h.Queries.UpdateAgentRuntimeVisibility(r.Context(), db.UpdateAgentRuntimeVisibilityParams{
-				ID:         runtimeUUID,
-				Visibility: v,
-			})
-			if err != nil {
-				slog.Error("UpdateAgentRuntimeVisibility failed", "error", err, "runtime_id", runtimeID)
-				writeError(w, http.StatusInternalServerError, "failed to update runtime")
-				return
-			}
-			rt = updated
-			// Notify connected clients that runtime metadata changed so the
-			// list/detail pages refresh — matches the pattern used by
-			// DeleteAgentRuntime.
-			h.publish(protocol.EventDaemonRegister, uuidToString(rt.WorkspaceID), "member", uuidToString(member.UserID), map[string]any{
-				"action": "update",
-			})
-		}
+		rt = updated
+		// Notify connected clients that runtime metadata changed so the
+		// list/detail pages refresh — matches the pattern used by
+		// DeleteAgentRuntime.
+		h.publish(protocol.EventDaemonRegister, uuidToString(rt.WorkspaceID), "member", uuidToString(member.UserID), map[string]any{
+			"action": "update",
+		})
 	}
 
 	writeJSON(w, http.StatusOK, runtimeToResponse(rt))

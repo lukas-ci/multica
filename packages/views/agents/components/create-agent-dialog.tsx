@@ -121,11 +121,18 @@ export function CreateAgentDialog({
 
   // When duplicating, default to the template's runtime so the clone
   // lands on the same machine — caller can still switch in the picker.
-  // Don't default to a disabled (other-owned private) runtime; let the
-  // user pick something usable instead.
-  const initialRuntime = template?.runtime_id
-    ? template.runtime_id
-    : filteredRuntimes.find((r) => !isRuntimeDisabledForUser(r))?.id ?? "";
+  // But never seed with a runtime the caller can't actually use (locked
+  // by visibility); otherwise the dialog opens with a selected row the
+  // user can't submit, and Create falls through to a backend 403. Falling
+  // back to the first usable runtime is friendlier than the locked
+  // pre-fill.
+  const templateRuntime = template?.runtime_id
+    ? runtimes.find((r) => r.id === template.runtime_id)
+    : undefined;
+  const initialRuntime =
+    templateRuntime && !isRuntimeDisabledForUser(templateRuntime)
+      ? templateRuntime.id
+      : filteredRuntimes.find((r) => !isRuntimeDisabledForUser(r))?.id ?? "";
   const [selectedRuntimeId, setSelectedRuntimeId] = useState(initialRuntime);
 
   useEffect(() => {
@@ -139,9 +146,15 @@ export function CreateAgentDialog({
   }, [filteredRuntimes, selectedRuntimeId]);
 
   const selectedRuntime = runtimes.find((d) => d.id === selectedRuntimeId) ?? null;
+  // Defense-in-depth: even if a locked runtime somehow ends up selected
+  // (e.g. duplicate of an agent whose template runtime is now locked, and
+  // the workspace has no usable fallback), gate Create on it so we don't
+  // submit a request the backend will reject with 403.
+  const selectedRuntimeLocked =
+    selectedRuntime != null && isRuntimeDisabledForUser(selectedRuntime);
 
   const handleSubmit = async () => {
-    if (!name.trim() || !selectedRuntime) return;
+    if (!name.trim() || !selectedRuntime || selectedRuntimeLocked) return;
     setCreating(true);
     try {
       // When duplicating, forward the hidden config fields the template
@@ -415,7 +428,14 @@ export function CreateAgentDialog({
           </Button>
           <Button
             onClick={handleSubmit}
-            disabled={creating || !name.trim() || !selectedRuntime}
+            disabled={
+              creating || !name.trim() || !selectedRuntime || selectedRuntimeLocked
+            }
+            title={
+              selectedRuntimeLocked
+                ? t(($) => $.create_dialog.runtime_private_locked_tooltip)
+                : undefined
+            }
           >
             {creating ? t(($) => $.create_dialog.creating) : t(($) => $.create_dialog.create)}
           </Button>

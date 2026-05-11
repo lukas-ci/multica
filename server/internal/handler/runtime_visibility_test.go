@@ -274,6 +274,84 @@ func TestUpdateAgent_RejectsRebindToPrivateRuntime(t *testing.T) {
 	}
 }
 
+// TestUpdateAgentRuntime_CombinedPatchAppliesBoth pins the post-review
+// invariant that a PATCH carrying BOTH `timezone` and `visibility` runs
+// both mutations. Before the fix, the timezone branch returned early on
+// a tz no-op (`tz == rt.Timezone`) and the visibility branch was never
+// reached, silently dropping half of a legitimate request.
+func TestUpdateAgentRuntime_CombinedPatchAppliesBoth(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	runtimeID, runtimeOwnerID, _ := runtimeVisibilityFixture(t)
+
+	// Use the runtime's CURRENT timezone (UTC by default) so the timezone
+	// branch is a no-op — that's the exact case the old short-circuit hit.
+	w := httptest.NewRecorder()
+	req := newRequestAs(runtimeOwnerID, http.MethodPatch, "/api/runtimes/"+runtimeID, map[string]any{
+		"timezone":   "UTC",
+		"visibility": "public",
+	})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.UpdateAgentRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH timezone+visibility (tz no-op): expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp AgentRuntimeResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Visibility != "public" {
+		t.Fatalf("combined patch dropped visibility: got %q, want public", resp.Visibility)
+	}
+}
+
+// TestUpdateAgentRuntime_InvalidVisibilityDoesNotMutateTimezone pins the
+// other half of the ordering fix: when visibility is invalid the handler
+// must 400 BEFORE running the timezone mutation, so a malformed request
+// can't leave the row half-updated (timezone written, visibility rejected).
+func TestUpdateAgentRuntime_InvalidVisibilityDoesNotMutateTimezone(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	runtimeID, runtimeOwnerID, _ := runtimeVisibilityFixture(t)
+
+	ctx := context.Background()
+	// Snapshot the timezone before the request so we can assert it didn't
+	// move. The fixture inserts the runtime with the table default (UTC),
+	// but we read instead of hard-coding so future fixture changes don't
+	// silently make the test pass for the wrong reason.
+	var beforeTZ string
+	if err := testPool.QueryRow(ctx,
+		`SELECT timezone FROM agent_runtime WHERE id = $1`, runtimeID,
+	).Scan(&beforeTZ); err != nil {
+		t.Fatalf("snapshot timezone: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newRequestAs(runtimeOwnerID, http.MethodPatch, "/api/runtimes/"+runtimeID, map[string]any{
+		"timezone":   "Asia/Tokyo",
+		"visibility": "everyone",
+	})
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.UpdateAgentRuntime(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH with invalid visibility: expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var afterTZ string
+	if err := testPool.QueryRow(ctx,
+		`SELECT timezone FROM agent_runtime WHERE id = $1`, runtimeID,
+	).Scan(&afterTZ); err != nil {
+		t.Fatalf("re-read timezone: %v", err)
+	}
+	if afterTZ != beforeTZ {
+		t.Fatalf("400 on visibility must not mutate timezone: before=%q after=%q", beforeTZ, afterTZ)
+	}
+}
+
 // TestUpdateAgentRuntime_VisibilityToggle covers the PATCH endpoint:
 // runtime owner / workspace admin can flip private↔public; plain members
 // cannot; an unknown value is rejected with 400.

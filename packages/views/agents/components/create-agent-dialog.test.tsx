@@ -3,7 +3,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, fireEvent } from "@testing-library/react";
-import type { MemberWithUser, RuntimeDevice } from "@multica/core/types";
+import type { Agent, MemberWithUser, RuntimeDevice } from "@multica/core/types";
 import { I18nProvider } from "@multica/core/i18n/react";
 import enCommon from "../../locales/en/common.json";
 import enAgents from "../../locales/en/agents.json";
@@ -84,7 +84,34 @@ function makeRuntime(overrides: Partial<RuntimeDevice>): RuntimeDevice {
   };
 }
 
-function renderDialog(runtimes: RuntimeDevice[]) {
+function makeTemplate(runtimeId: string): Agent {
+  return {
+    id: "agent-template",
+    workspace_id: "ws-1",
+    runtime_id: runtimeId,
+    name: "Template Agent",
+    description: "",
+    instructions: "",
+    avatar_url: null,
+    runtime_mode: "local",
+    runtime_config: {},
+    custom_env: {},
+    custom_args: [],
+    custom_env_redacted: false,
+    visibility: "private",
+    status: "idle",
+    max_concurrent_tasks: 1,
+    model: "",
+    owner_id: ME,
+    skills: [],
+    created_at: "2026-04-01T00:00:00Z",
+    updated_at: "2026-04-01T00:00:00Z",
+    archived_at: null,
+    archived_by: null,
+  };
+}
+
+function renderDialog(runtimes: RuntimeDevice[], template?: Agent) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -97,6 +124,7 @@ function renderDialog(runtimes: RuntimeDevice[]) {
           runtimes={runtimes}
           members={members}
           currentUserId={ME}
+          template={template}
           onClose={onClose}
           onCreate={onCreate}
         />
@@ -176,5 +204,63 @@ describe("CreateAgentDialog runtime visibility gate", () => {
     // first in the input list.
     expect(screen.queryByText("Others Private", { selector: "span.truncate" })).toBeNull();
     expect(screen.getByText("My Runtime", { selector: "span.truncate" })).toBeInTheDocument();
+  });
+
+  it("in duplicate mode, does not pre-fill the template's runtime when it's now locked", async () => {
+    // Template runtime is owned by someone else and now private — the
+    // duplicate flow used to seed with it anyway, leaving the user with
+    // a Create button that 403s server-side. Now we fall back to the
+    // first usable runtime instead.
+    const othersPrivate = makeRuntime({
+      id: "rt-others-private",
+      name: "Others Private",
+      owner_id: OTHER,
+      visibility: "private",
+    });
+    const mine = makeRuntime({
+      id: "rt-mine",
+      name: "My Runtime",
+      owner_id: ME,
+      visibility: "private",
+    });
+    const template = makeTemplate("rt-others-private");
+    const { onCreate } = renderDialog([othersPrivate, mine], template);
+
+    expect(
+      screen.getByText("My Runtime", { selector: "span.truncate" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Others Private", { selector: "span.truncate" }),
+    ).toBeNull();
+
+    // Sanity check: with a usable selection seeded, Create should submit.
+    fireEvent.click(screen.getByText("Create"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    expect(onCreate.mock.calls[0]?.[0].runtime_id).toBe("rt-mine");
+  });
+
+  it("disables Create when the selected runtime is locked (template + no usable fallback)", () => {
+    // Edge case: template points at a locked runtime AND the workspace
+    // has no usable alternatives in scope. The defense-in-depth gate on
+    // the Create button must keep the user from submitting a 403.
+    const onlyOthersPrivate = makeRuntime({
+      id: "rt-only-others-private",
+      name: "Only Others Private",
+      owner_id: OTHER,
+      visibility: "private",
+    });
+    // Flip the picker to "All" so the locked runtime is at least
+    // visible — that's the scope where the selected-but-locked state
+    // can persist after the initial seed search returns nothing.
+    const template = makeTemplate("rt-only-others-private");
+    renderDialog([onlyOthersPrivate], template);
+
+    // The Create button is rendered by lucide-free CTA text "Create".
+    const createBtn = screen
+      .getAllByRole("button")
+      .find((b) => b.textContent === "Create");
+    expect(createBtn).toBeDefined();
+    expect((createBtn as HTMLButtonElement).disabled).toBe(true);
   });
 });
