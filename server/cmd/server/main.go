@@ -123,7 +123,17 @@ func main() {
 	if os.Getenv("JWT_SECRET") == "" {
 		slog.Warn("JWT_SECRET is not set — using insecure default. Set JWT_SECRET for production use.")
 	}
-	if os.Getenv("RESEND_API_KEY") == "" {
+	if os.Getenv("EMAIL_PROVIDER") == "smtp" {
+		if os.Getenv("SMTP_HOST") == "" {
+			slog.Warn("EMAIL_PROVIDER=smtp but SMTP_HOST is not set — email will fail to send.")
+		}
+		if os.Getenv("SMTP_FROM_EMAIL") == "" {
+			slog.Warn("EMAIL_PROVIDER=smtp but SMTP_FROM_EMAIL is not set — email may be rejected.")
+		}
+		if os.Getenv("SMTP_HOST") == "mailpit" {
+			slog.Info("SMTP host is 'mailpit' — emails are captured locally; view at http://localhost:8025 or http://<host>:8025")
+		}
+	} else if os.Getenv("RESEND_API_KEY") == "" {
 		slog.Warn("RESEND_API_KEY is not set — email verification codes will be printed to the log instead of emailed.")
 	}
 	if os.Getenv("MULTICA_DEV_VERIFICATION_CODE") != "" {
