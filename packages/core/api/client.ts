@@ -206,6 +206,11 @@ export class ApiClient {
     return this.baseUrl;
   }
 
+  /** Generic request — for endpoints without a dedicated typed method. */
+  async request<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+    return this.fetch<T>(path, init);
+  }
+
   setToken(token: string | null) {
     this.token = token;
   }
