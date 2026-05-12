@@ -1107,6 +1107,14 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	if task.IssueID.Valid {
 		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
 			resp.WorkspaceID = uuidToString(issue.WorkspaceID)
+			// Captain detection: when the issue's captain points at the same
+			// agent that's claiming this task, mark the task so the daemon
+			// renders the captain-specific prompt prelude. Captain field is
+			// orthogonal to assignee; both can co-exist on the same issue.
+			if issue.CaptainType.Valid && issue.CaptainID.Valid &&
+				uuidToString(issue.CaptainID) == uuidToString(task.AgentID) {
+				resp.IsCaptainTrigger = true
+			}
 
 			var projectRepos []RepoData
 			if issue.ProjectID.Valid {

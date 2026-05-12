@@ -267,6 +267,18 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 		b.WriteString("- Do not run `multica issue get`, `multica issue comment add`, or `multica issue status` for this run unless the autopilot instructions explicitly tell you to create or update an issue\n\n")
 	} else if ctx.TriggerCommentID != "" {
 		// Comment-triggered: focus on reading and replying
+		if ctx.IsCaptainTrigger {
+			// Captain prelude: this agent is the issue's designated router.
+			// The captain decides whether to handle the comment itself,
+			// delegate to another agent via @mention, or stay silent. The
+			// concrete routing logic lives in the agent's own Instructions —
+			// this prelude only establishes the role and the loop-defense rules.
+			b.WriteString("**You are the CAPTAIN of this issue.** The issue's captain field points at you, which is why you were triggered by this comment instead of the assignee. Your job is to ROUTE the comment per your own Agent Instructions — typically by deciding whether to handle it yourself, delegate to another agent via `@mention`, or stay silent.\n\n")
+			b.WriteString("Captain rules (apply on top of the comment-reply workflow below):\n")
+			b.WriteString("- The captain field replaces the assignee-based comment trigger; the assignee will NOT also be triggered by this same comment, so do not assume someone else will pick it up.\n")
+			b.WriteString("- Only @mention another agent if you are delegating concrete work to them; do not mention them just to acknowledge or sign off.\n")
+			b.WriteString("- If you decide a comment is purely conversational and needs no action, exit silently — do not post a 'no action needed' comment.\n\n")
+		}
 		b.WriteString("**This task was triggered by a NEW comment.** Your primary job is to respond to THIS specific comment, even if you have handled similar requests before in this session.\n\n")
 		fmt.Fprintf(&b, "1. Run `multica issue get %s --output json` to understand the issue context\n", ctx.IssueID)
 		fmt.Fprintf(&b, "2. Run `multica issue comment list %s --output json` to read the conversation (returns all comments, capped server-side at 2000)\n", ctx.IssueID)

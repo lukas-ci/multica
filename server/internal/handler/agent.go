@@ -160,6 +160,7 @@ type AgentTaskResponse struct {
 	PriorWorkDir            string                `json:"prior_work_dir,omitempty"`            // work_dir from a previous task on same issue
 	WorkDir                 string                `json:"work_dir,omitempty"`                  // local working directory pinned for this task; populated once the daemon reports it
 	TriggerCommentID        *string               `json:"trigger_comment_id,omitempty"`        // comment that triggered this task
+	IsCaptainTrigger        bool                  `json:"is_captain_trigger,omitempty"`        // true when issue.captain points at this task's agent — drives the captain prompt prelude on the daemon
 	TriggerCommentContent   string                `json:"trigger_comment_content,omitempty"`   // content of the triggering comment
 	TriggerSummary          *string               `json:"trigger_summary,omitempty"`           // canonical short description snapshot — comment text / autopilot title — taken at task creation; survives source edits/deletes
 	TriggerAuthorType       string                `json:"trigger_author_type,omitempty"`       // "agent" or "member" — author kind of the triggering comment

@@ -44,6 +44,7 @@ type PrepareParams struct {
 type TaskContextForEnv struct {
 	IssueID                 string
 	TriggerCommentID        string // comment that triggered this task (empty for on_assign)
+	IsCaptainTrigger        bool   // true when this task was enqueued because the issue's captain is this agent — drives a captain-specific prompt prelude
 	AgentID                 string // unique ID of the dispatched agent
 	AgentName               string
 	AgentInstructions       string // agent identity/persona instructions, injected into CLAUDE.md
