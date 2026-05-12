@@ -664,6 +664,15 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 		}
 
 		if statusChanged {
+			prevStatus, _ := payload["prev_status"].(string)
+			statusDetails, _ := json.Marshal(map[string]string{
+				"from": prevStatus,
+				"to":   issue.Status,
+			})
+			notifySubscribers(ctx, queries, bus, issue.ID, issue.Status, e.WorkspaceID, e,
+				nil, "status_changed", "info",
+				issue.Title, "",
+				statusDetails)
 
 			// When the issue progresses past the failure (in_review / done /
 			// cancelled), retire any stale task_failed inbox rows so the
