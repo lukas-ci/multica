@@ -344,3 +344,57 @@ func TestActivityTaskFailed(t *testing.T) {
 		t.Fatalf("expected action 'task_failed', got %q", activities[0].Action)
 	}
 }
+
+// TestActivityIssueUpdated_CaptainChanged verifies that setting an issue's
+// captain produces a `captain_changed` activity entry with from/to details.
+func TestActivityIssueUpdated_CaptainChanged(t *testing.T) {
+queries := db.New(testPool)
+bus := events.New()
+registerActivityListeners(bus, queries)
+
+issueID := createTestIssue(t, testWorkspaceID, testUserID)
+t.Cleanup(func() {
+cleanupActivities(t, issueID)
+cleanupTestIssue(t, issueID)
+})
+
+captainType := "agent"
+captainID := "00000000-0000-0000-0000-bbbbbbbbbbbb"
+bus.Publish(events.Event{
+Type:        protocol.EventIssueUpdated,
+WorkspaceID: testWorkspaceID,
+ActorType:   "member",
+ActorID:     testUserID,
+Payload: map[string]any{
+"issue": handler.IssueResponse{
+ID:          issueID,
+WorkspaceID: testWorkspaceID,
+Title:       "captain activity test",
+Status:      "todo",
+Priority:    "medium",
+CreatorType: "member",
+CreatorID:   testUserID,
+CaptainType: &captainType,
+CaptainID:   &captainID,
+},
+"captain_changed":   true,
+"prev_captain_type": (*string)(nil),
+"prev_captain_id":   (*string)(nil),
+},
+})
+
+activities := listActivitiesForIssue(t, queries, issueID)
+if len(activities) != 1 {
+t.Fatalf("expected 1 activity, got %d", len(activities))
+}
+if activities[0].Action != "captain_changed" {
+t.Fatalf("expected action 'captain_changed', got %q", activities[0].Action)
+}
+var details map[string]string
+if err := json.Unmarshal(activities[0].Details, &details); err != nil {
+t.Fatalf("unmarshal details: %v", err)
+}
+if details["to_type"] != "agent" || details["to_id"] != captainID {
+t.Fatalf("unexpected details: %+v", details)
+}
+}

@@ -632,3 +632,108 @@ func TestCommentTriggerMentionAssigneeDoneIssue(t *testing.T) {
 		t.Errorf("expected 1 pending task after @mention of assignee on done issue, got %d", n)
 	}
 }
+
+// TestCommentTrigger_CaptainBypassesAssigneeHeuristics verifies that when an
+// issue has a captain set, comment-trigger routing goes through the captain
+// alone — even when the comment @mentions someone else. The legacy
+// "skip if mentions someone other than the assignee" gate must be bypassed.
+//
+// Regression target: J's review (PR #2463). With Option 2, captain takes
+// over routing entirely; the captain's own instructions decide what to do.
+func TestCommentTrigger_CaptainBypassesAssigneeHeuristics(t *testing.T) {
+captainID := getAgentID(t)
+otherAgentID := createSecondAgent(t)
+
+// Create an issue with no assignee; set the captain to captainID.
+issueID := createIssue(t, "Captain bypasses assignee heuristics")
+resp := authRequest(t, "PUT", "/api/issues/"+issueID, map[string]any{
+"captain_type": "agent",
+"captain_id":   captainID,
+})
+resp.Body.Close()
+clearTasks(t, issueID)
+t.Cleanup(func() {
+clearTasks(t, issueID)
+resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
+resp.Body.Close()
+})
+
+// A member comment that @mentions a *different* agent — the legacy
+// path would suppress on_comment because the mention isn't the assignee,
+// but the captain path must enqueue exactly one task for the captain.
+content := fmt.Sprintf("[@Other](mention://agent/%s) heads up", otherAgentID)
+postComment(t, issueID, content, nil)
+
+// Expect exactly one pending task and it must be for the captain — even
+// though @other was mentioned, mention-routing also enqueues the
+// mentioned agent. We assert that at least one pending task is for the
+// captain (proving the captain path fired).
+if n := countPendingTasks(t, issueID); n < 1 {
+t.Fatalf("expected >=1 pending task (captain path), got %d", n)
+}
+var captainTasks int
+if err := testPool.QueryRow(context.Background(),
+`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued','dispatched')`,
+issueID, captainID).Scan(&captainTasks); err != nil {
+t.Fatalf("count captain tasks: %v", err)
+}
+if captainTasks != 1 {
+t.Errorf("expected 1 task for captain, got %d", captainTasks)
+}
+}
+
+// TestCommentTrigger_CaptainSelfCommentDoesNotLoop verifies that a comment
+// posted by the captain agent itself does NOT enqueue a new task for the
+// captain (loop defense).
+func TestCommentTrigger_CaptainSelfCommentDoesNotLoop(t *testing.T) {
+captainID := getAgentID(t)
+issueID := createIssue(t, "Captain self-comment no loop")
+resp := authRequest(t, "PUT", "/api/issues/"+issueID, map[string]any{
+"captain_type": "agent",
+"captain_id":   captainID,
+})
+resp.Body.Close()
+clearTasks(t, issueID)
+t.Cleanup(func() {
+clearTasks(t, issueID)
+resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
+resp.Body.Close()
+})
+
+// Captain posts a comment as itself.
+postCommentAsAgent(t, issueID, "I am the captain, status update.", captainID, nil)
+
+if n := countPendingTasks(t, issueID); n != 0 {
+t.Errorf("expected 0 pending tasks (captain self-comment must not loop), got %d", n)
+}
+}
+
+// TestCommentTrigger_CaptainPendingDedup verifies that when a queued task
+// for the captain already exists, a new comment does not enqueue a second
+// captain task (HasPendingTaskForIssueAndAgent dedup).
+func TestCommentTrigger_CaptainPendingDedup(t *testing.T) {
+captainID := getAgentID(t)
+issueID := createIssue(t, "Captain pending dedup")
+resp := authRequest(t, "PUT", "/api/issues/"+issueID, map[string]any{
+"captain_type": "agent",
+"captain_id":   captainID,
+})
+resp.Body.Close()
+clearTasks(t, issueID)
+t.Cleanup(func() {
+clearTasks(t, issueID)
+resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
+resp.Body.Close()
+})
+
+// First member comment enqueues the captain.
+postComment(t, issueID, "first request", nil)
+if n := countPendingTasks(t, issueID); n != 1 {
+t.Fatalf("expected 1 pending task after first comment, got %d", n)
+}
+// Second member comment must be deduped — pending captain task already exists.
+postComment(t, issueID, "second request", nil)
+if n := countPendingTasks(t, issueID); n != 1 {
+t.Errorf("expected 1 pending task (dedup), got %d", n)
+}
+}
