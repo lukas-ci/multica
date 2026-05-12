@@ -32,6 +32,10 @@ func BuildPrompt(task Task, provider string) string {
 	fmt.Fprintf(&b, "Your assigned issue ID is: %s\n\n", task.IssueID)
 	fmt.Fprintf(&b, "Start by running `multica issue get %s --output json` to understand your task, then complete it.\n", task.IssueID)
 	fmt.Fprintf(&b, "If you need comment history, `multica issue comment list %s --output json` returns all comments for the issue (server caps at 2000). Pass `--since <RFC3339>` to fetch only comments newer than a known cursor.\n", task.IssueID)
+	b.WriteString("\n## Knowledge sources\n\n")
+	b.WriteString("Your workspace may have linked knowledge sources (Confluence, GitHub, etc.).\n")
+	b.WriteString("Use the `knowledge_search` tool when you need context — it searches\n")
+	b.WriteString("indexed content from your workspace. Prefer this over guessing.\n")
 	return b.String()
 }
 
