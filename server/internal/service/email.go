@@ -13,6 +13,8 @@ import (
 	"github.com/resend/resend-go/v2"
 )
 
+// maxSubjectFieldRunes caps the length of user-controlled text in email Subject
+// lines to prevent header-injection-style abuse via long strings.
 const maxSubjectFieldRunes = 60
 
 type EmailSender interface {
@@ -102,9 +104,11 @@ type smtpSender struct {
 	port      int
 	username  string
 	password  string
+	devMode   bool
 }
 
 func newSMTPSender() *smtpSender {
+	host := os.Getenv("SMTP_HOST")
 	port := 1025
 	if p := os.Getenv("SMTP_PORT"); p != "" {
 		if v, err := strconv.Atoi(p); err == nil {
@@ -113,14 +117,21 @@ func newSMTPSender() *smtpSender {
 	}
 	return &smtpSender{
 		fromEmail: os.Getenv("SMTP_FROM_EMAIL"),
-		host:      os.Getenv("SMTP_HOST"),
+		host:      host,
 		port:      port,
 		username:  os.Getenv("SMTP_USERNAME"),
 		password:  os.Getenv("SMTP_PASSWORD"),
+		devMode:   host == "",
 	}
 }
 
+// SendVerificationCode sends a verification code email via SMTP.
+// When devMode is enabled, it prints the code to stdout instead.
 func (s *smtpSender) SendVerificationCode(to, code string) error {
+	if s.devMode {
+		fmt.Printf("[DEV] Verification code for %s: %s\n", to, code)
+		return nil
+	}
 	msg := gomail.NewMessage()
 	msg.SetHeader("From", s.fromEmail)
 	msg.SetHeader("To", to)
@@ -131,7 +142,18 @@ func (s *smtpSender) SendVerificationCode(to, code string) error {
 	return d.DialAndSend(msg)
 }
 
+// SendInvitationEmail sends an invitation email via SMTP.
+// When devMode is enabled, it prints the invitation details to stdout instead.
 func (s *smtpSender) SendInvitationEmail(to, inviterName, workspaceName, invitationID string) error {
+	if s.devMode {
+		appURL := strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+		if appURL == "" {
+			appURL = "https://app.multica.ai"
+		}
+		inviteURL := fmt.Sprintf("%s/invite/%s", appURL, invitationID)
+		fmt.Printf("[DEV] Invitation email to %s: %s invited you to %s — %s\n", to, inviterName, workspaceName, inviteURL)
+		return nil
+	}
 	appURL := strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
 	if appURL == "" {
 		appURL = "https://app.multica.ai"
