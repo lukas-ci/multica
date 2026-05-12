@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { BookOpen, Plus, Search, Trash2, AlertCircle } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
@@ -188,16 +188,31 @@ export function KnowledgePage() {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
 
-  const fetchSources = () => {
-    setLoading(true);
-    api.request<KnowledgeSource[]>("/api/knowledge/sources")
-      .then((data) => setSources(Array.isArray(data) ? data : []))
-      .catch(() => setSources([]))
-      .finally(() => setLoading(false));
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const fetchSources = (isPolling = false) => {
+    if (!isPolling) setLoading(true);
+    api.request<{sources: KnowledgeSource[]}>("/api/knowledge/sources")
+      .then((data) => {
+        const list = Array.isArray(data.sources) ? data.sources : [];
+        setSources(list);
+        const hasPending = list.some(s => s.sync_status === "pending" || s.sync_status === "syncing");
+        if (hasPending && !intervalRef.current) {
+          intervalRef.current = setInterval(() => fetchSources(true), 3000);
+        } else if (!hasPending && intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      })
+      .catch(() => {
+        if (!isPolling) setSources([]);
+      })
+      .finally(() => { if (!isPolling) setLoading(false); });
   };
 
   useEffect(() => {
     fetchSources();
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, []);
 
   const handleRemove = async (id: string) => {

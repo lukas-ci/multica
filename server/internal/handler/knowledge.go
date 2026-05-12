@@ -112,7 +112,16 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]string{"id": uuidToString(id)})
+	sourceID := uuidToString(id)
+	sourceIDStr := sourceID
+
+	// Auto-trigger sync in background
+	go func() {
+		ctx := r.Context()
+		h.syncKnowledgeSource(ctx, parseUUID(workspaceID), parseUUID(sourceIDStr), req.SourceType, req.Config)
+	}()
+
+	writeJSON(w, http.StatusCreated, map[string]string{"id": sourceID})
 }
 
 func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) {
@@ -150,6 +159,36 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
+func (h *Handler) syncKnowledgeSource(ctx context.Context, wsUUID, srcUUID pgtype.UUID, sourceType string, configJSON json.RawMessage) {
+	if h.KnowledgeManager == nil {
+		slog.Warn("syncKnowledgeSource: KnowledgeManager not available")
+		return
+	}
+
+	h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1`, srcUUID)
+
+	connector := sources.NewConnector(knowledge.SourceType(sourceType))
+	if connector == nil {
+		slog.Warn("syncKnowledgeSource: unknown source type", "source_type", sourceType)
+		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'unknown source type' WHERE id = $1`, srcUUID)
+		return
+	}
+
+	workspaceID := uuidToString(wsUUID)
+	chunks, err := connector.Fetch(workspaceID, string(configJSON))
+	if err != nil {
+		slog.Warn("syncKnowledgeSource fetch failed", "error", err)
+		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
+		return
+	}
+	if err := h.KnowledgeManager.IndexChunks(ctx, workspaceID, chunks); err != nil {
+		slog.Warn("syncKnowledgeSource index failed", "error", err)
+		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
+		return
+	}
+	h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'ready', last_synced_at = now() WHERE id = $1`, srcUUID)
+}
+
 func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 	sourceID := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
@@ -163,9 +202,10 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var sourceType, configJSON string
+	var sourceType string
+	var configJSON json.RawMessage
 	err := h.DB.QueryRow(r.Context(), `
-		SELECT source_type, config::text FROM knowledge_sources
+		SELECT source_type, config FROM knowledge_sources
 		WHERE id = $1 AND workspace_id = $2
 	`, srcUUID, wsUUID).Scan(&sourceType, &configJSON)
 	if err != nil {
@@ -183,36 +223,11 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update status to syncing
-	_, err = h.DB.Exec(r.Context(), `
-		UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1
-	`, srcUUID)
-	if err != nil {
-		slog.Warn("SyncKnowledgeSource status update failed", append(logger.RequestAttrs(r), "error", err)...)
-	}
-
 	// Run sync in background
-	go func() {
-		ctx := r.Context()
-		connector := sources.NewConnector(knowledge.SourceType(sourceType))
-		if connector == nil {
-			slog.Warn("SyncKnowledgeSource: unknown source type", "source_type", sourceType, "source_id", sourceID)
-			h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'unknown source type' WHERE id = $1`, srcUUID)
-			return
-		}
-		chunks, err := connector.Fetch(workspaceID, configJSON)
-		if err != nil {
-			slog.Warn("SyncKnowledgeSource fetch failed", "source_id", sourceID, "error", err)
-			h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
-			return
-		}
-		if err := h.KnowledgeManager.IndexChunks(ctx, workspaceID, chunks); err != nil {
-			slog.Warn("SyncKnowledgeSource index failed", "source_id", sourceID, "error", err)
-			h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
-			return
-		}
-		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'ready', last_synced_at = now() WHERE id = $1`, srcUUID)
-	}()
+	go h.syncKnowledgeSource(r.Context(), wsUUID, srcUUID, sourceType, configJSON)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
+}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
 }
