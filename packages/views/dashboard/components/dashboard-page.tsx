@@ -31,6 +31,8 @@ import {
   aggregateDailyCost,
   computeDailyTotals,
   formatDuration,
+  mergeAgentDashboardRows,
+  type AgentDashboardRow,
 } from "../utils";
 
 // One-place source of truth for the period selector. Matches the runtime
@@ -107,14 +109,23 @@ export function DashboardPage() {
   const [days, setDays] = useState<TimeRange>(30);
   const [projectValue, setProjectValue] = useState<string>(ALL_PROJECTS);
 
-  const projectId = projectValue === ALL_PROJECTS ? null : projectValue;
-
   // The user can save model prices from the runtimes page; re-render when
   // they do so the dashboard reflects the new rates.
   useCustomPricingStore((s) => s.pricings);
 
   const { data: projects = [] } = useQuery(projectListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
+
+  // Validate the picked project against the current workspace's list. A
+  // stale UUID — left over from a project that's been deleted, or from the
+  // previous workspace after a switch — would silently filter all three
+  // queries to empty rows while the dropdown still reads "All projects".
+  // Derive the effective filter so the API call matches the user-visible
+  // selection.
+  const projectId = useMemo(() => {
+    if (projectValue === ALL_PROJECTS) return null;
+    return projects.some((p) => p.id === projectValue) ? projectValue : null;
+  }, [projectValue, projects]);
 
   const dailyQuery = useQuery(dashboardUsageDailyOptions(wsId, days, projectId));
   const byAgentQuery = useQuery(dashboardUsageByAgentOptions(wsId, days, projectId));
@@ -157,51 +168,10 @@ export function DashboardPage() {
     return { totalSeconds, taskCount, failedCount };
   }, [runTimeRows]);
 
-  // Combine token + run-time into the one agent list. Outer join: an agent
-  // shows up if it has tokens OR if it had any terminal task; cost or time
-  // fields stay 0 for the dimension it doesn't appear in.
-  const agentRows = useMemo(() => {
-    const merged = new Map<
-      string,
-      {
-        agentId: string;
-        tokens: number;
-        cost: number;
-        seconds: number;
-        taskCount: number;
-      }
-    >();
-    for (const r of agentTokenRows) {
-      merged.set(r.agentId, {
-        agentId: r.agentId,
-        tokens: r.tokens,
-        cost: r.cost,
-        seconds: 0,
-        taskCount: r.taskCount,
-      });
-    }
-    for (const r of runTimeRows) {
-      const entry = merged.get(r.agent_id) ?? {
-        agentId: r.agent_id,
-        tokens: 0,
-        cost: 0,
-        seconds: 0,
-        taskCount: 0,
-      };
-      entry.seconds += r.total_seconds;
-      // Token rollup already counts tasks via distinct task ids; the
-      // run-time rollup counts terminal task rows. They can disagree —
-      // prefer the larger value as a "total tasks the agent ran" figure.
-      if (r.task_count > entry.taskCount) entry.taskCount = r.task_count;
-      merged.set(r.agent_id, entry);
-    }
-    // Stable sort: cost desc, then run time desc as a tiebreaker so an
-    // agent with no tokens but lots of time still gets a non-trivial rank.
-    return [...merged.values()].sort((a, b) => {
-      if (b.cost !== a.cost) return b.cost - a.cost;
-      return b.seconds - a.seconds;
-    });
-  }, [agentTokenRows, runTimeRows]);
+  const agentRows = useMemo(
+    () => mergeAgentDashboardRows(agentTokenRows, runTimeRows),
+    [agentTokenRows, runTimeRows],
+  );
 
   return (
     <div className="flex h-full flex-col">
@@ -352,20 +322,12 @@ function DailyCostBlock({
   );
 }
 
-interface AgentRow {
-  agentId: string;
-  tokens: number;
-  cost: number;
-  seconds: number;
-  taskCount: number;
-}
-
 function AgentList({
   rows,
   agents,
   lessThanMinuteLabel,
 }: {
-  rows: AgentRow[];
+  rows: AgentDashboardRow[];
   agents: { id: string; name: string }[];
   lessThanMinuteLabel: string;
 }) {

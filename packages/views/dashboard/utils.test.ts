@@ -4,6 +4,7 @@ import {
   aggregateDailyCost,
   computeDailyTotals,
   formatDuration,
+  mergeAgentDashboardRows,
 } from "./utils";
 
 describe("aggregateDailyCost", () => {
@@ -118,6 +119,75 @@ describe("computeDailyTotals", () => {
     expect(totals.input).toBe(3_000_000);
     expect(totals.cost).toBe(9); // 3M × $3/M
     expect(totals.taskCount).toBe(5);
+  });
+});
+
+describe("mergeAgentDashboardRows", () => {
+  it("uses run-time rollup's per-agent task count, not the token sum", () => {
+    // Token rollup returns two (agent, model) rows for the same task
+    // (the agent ran one task that touched two models). The token-side
+    // aggregator sums per-row task_count and lands at 2; the run-time
+    // rollup correctly reports the underlying distinct count of 1.
+    const tokenRows = [
+      {
+        agentId: "agent-a",
+        tokens: 3_000_000,
+        cost: 12,
+        taskCount: 2, // overcounted because (model-1: 1) + (model-2: 1)
+      },
+    ];
+    const runTimeRows = [
+      {
+        agent_id: "agent-a",
+        total_seconds: 600,
+        task_count: 1, // truth: one task touched both models
+        failed_count: 0,
+      },
+    ];
+    const merged = mergeAgentDashboardRows(tokenRows, runTimeRows);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.taskCount).toBe(1);
+    expect(merged[0]!.seconds).toBe(600);
+  });
+
+  it("falls back to token count when no run-time row exists (in-flight task)", () => {
+    // Tokens reported mid-run; task hasn't terminated yet so the run-time
+    // rollup is silent on this agent. Keep the token-side estimate
+    // instead of dropping the agent from the table entirely.
+    const merged = mergeAgentDashboardRows(
+      [{ agentId: "agent-b", tokens: 100, cost: 0.5, taskCount: 1 }],
+      [],
+    );
+    expect(merged[0]!.taskCount).toBe(1);
+    expect(merged[0]!.seconds).toBe(0);
+  });
+
+  it("includes agents that have run-time but no tokens", () => {
+    // Task errored before reporting any usage — run-time row exists but
+    // there's no corresponding token row. Agent must still appear on the
+    // list with zeroed-out token columns.
+    const merged = mergeAgentDashboardRows(
+      [],
+      [{ agent_id: "agent-c", total_seconds: 30, task_count: 1, failed_count: 1 }],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.tokens).toBe(0);
+    expect(merged[0]!.cost).toBe(0);
+    expect(merged[0]!.taskCount).toBe(1);
+  });
+
+  it("sorts by cost desc with run-time as a tiebreaker", () => {
+    const merged = mergeAgentDashboardRows(
+      [
+        { agentId: "low", tokens: 100, cost: 1, taskCount: 1 },
+        { agentId: "high", tokens: 100, cost: 9, taskCount: 1 },
+        { agentId: "zero-cost-long", tokens: 0, cost: 0, taskCount: 0 },
+      ],
+      [
+        { agent_id: "zero-cost-long", total_seconds: 1000, task_count: 5, failed_count: 0 },
+      ],
+    );
+    expect(merged.map((r) => r.agentId)).toEqual(["high", "low", "zero-cost-long"]);
   });
 });
 

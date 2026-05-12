@@ -1,6 +1,7 @@
 import type {
   DashboardUsageDaily,
   DashboardUsageByAgent,
+  DashboardAgentRunTime,
 } from "@multica/core/types";
 import { estimateCost, estimateCostBreakdown } from "../runtimes/utils";
 
@@ -119,6 +120,60 @@ export function aggregateAgentTokens(rows: DashboardUsageByAgent[]): AgentCostRo
     map.set(r.agent_id, entry);
   }
   return [...map.values()].sort((a, b) => b.cost - a.cost);
+}
+
+export interface AgentDashboardRow {
+  agentId: string;
+  tokens: number;
+  cost: number;
+  seconds: number;
+  taskCount: number;
+}
+
+// Merge per-agent token totals with per-agent run-time totals into one
+// row per agent.
+//
+// taskCount comes from `runTimeRows` when available — that rollup is a
+// true per-agent distinct count (`COUNT(*)` on (agent, terminal-task) in
+// SQL). The token rollup's per-(agent, model) counts double-count a task
+// when it spans multiple models, so we only fall back to it for agents
+// with no terminal run yet (in-flight tasks reported tokens but haven't
+// completed). Sorted by cost desc, then run time desc.
+export function mergeAgentDashboardRows(
+  tokenRows: AgentCostRow[],
+  runTimeRows: DashboardAgentRunTime[],
+): AgentDashboardRow[] {
+  const runTimeByAgent = new Map(
+    runTimeRows.map((r) => [r.agent_id, r] as const),
+  );
+  const merged = new Map<string, AgentDashboardRow>();
+  for (const r of tokenRows) {
+    const rt = runTimeByAgent.get(r.agentId);
+    merged.set(r.agentId, {
+      agentId: r.agentId,
+      tokens: r.tokens,
+      cost: r.cost,
+      seconds: rt?.total_seconds ?? 0,
+      taskCount: rt ? rt.task_count : r.taskCount,
+    });
+  }
+  // Agents with run-time rows but zero tokens still belong on the list
+  // (a task that errored before producing usage). Their token columns
+  // stay at 0.
+  for (const r of runTimeRows) {
+    if (merged.has(r.agent_id)) continue;
+    merged.set(r.agent_id, {
+      agentId: r.agent_id,
+      tokens: 0,
+      cost: 0,
+      seconds: r.total_seconds,
+      taskCount: r.task_count,
+    });
+  }
+  return [...merged.values()].sort((a, b) => {
+    if (b.cost !== a.cost) return b.cost - a.cost;
+    return b.seconds - a.seconds;
+  });
 }
 
 // Compact human duration: "1h 23m" / "12m 30s" / "45s" / "<1m". Used for
