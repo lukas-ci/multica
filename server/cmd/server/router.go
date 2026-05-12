@@ -552,6 +552,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			r.Post("/sources/{id}/sync", h.SyncKnowledgeSource)
 			r.Post("/search", h.SearchKnowledge)
 		})
+
+		// MCP (Model Context Protocol) — lightweight tool-calling endpoint
+		// for AI agents. Exposed inside the workspace-member auth wall so
+		// every call is scoped to an authenticated user + workspace.
+		r.Post("/api/mcp", h.HandleMCP)
 	})
 	})
 
