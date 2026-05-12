@@ -21,6 +21,7 @@ import { DesktopRuntimesPage } from "./components/desktop-runtimes-page";
 import { AgentsPage } from "@multica/views/agents";
 import { InboxPage } from "@multica/views/inbox";
 import { SettingsPage } from "@multica/views/settings";
+import { KnowledgePage } from "./pages/knowledge-page";
 import { ErrorBoundary } from "@multica/ui/components/common/error-boundary";
 import { Download, Server } from "lucide-react";
 import { DaemonSettingsTab } from "./components/daemon-settings-tab";
@@ -146,6 +147,7 @@ export const appRoutes: RouteObject[] = [
             handle: { title: "Agent" },
           },
           { path: "inbox", element: <InboxPage />, handle: { title: "Inbox" } },
+          { path: "knowledge", element: <KnowledgePage />, handle: { title: "Knowledge" } },
           {
             path: "settings",
             element: (
