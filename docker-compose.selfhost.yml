@@ -67,6 +67,14 @@ services:
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}                                     
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}                                     
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-} 
+      KNOWLEDGE_EMBEDDING_PROVIDER: ${KNOWLEDGE_EMBEDDING_PROVIDER:-aigw}
+      AIGW_BASE_URL: ${AIGW_BASE_URL:-}
+      AIGW_API_KEY: ${AIGW_API_KEY:-}
+      AIGW_EMBEDDING_MODEL: ${AIGW_EMBEDDING_MODEL:-text-embedding-3-small}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      QDRANT_URL: ${QDRANT_URL:-grpc://qdrant:6334}
+      UNSTRUCTURED_URL: ${UNSTRUCTURED_URL:-http://unstructured:8000}
     restart: unless-stopped
 
   frontend:
@@ -86,6 +94,22 @@ services:
       - "${MAILPIT_UI_PORT:-8025}:8025"
     restart: unless-stopped
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "${QDRANT_GRPC_PORT:-6333}:6333"
+      - "${QDRANT_HTTP_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  unstructured:
+    image: downloads.unstructured.io/unstructured-io/unstructured:latest
+    ports:
+      - "${UNSTRUCTURED_PORT:-8000}:8000"
+    restart: unless-stopped
+
 volumes:
   pgdata:
   backend_uploads:
+  qdrant_data:
