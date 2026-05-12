@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/knowledge"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -107,7 +109,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		AllowedEmailDomains:           splitAndTrim(os.Getenv("ALLOWED_EMAIL_DOMAINS")),
 		UseDailyRollupForRuntimeUsage: os.Getenv("USAGE_DAILY_ROLLUP_ENABLED") == "true",
 	}
-	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
+	knowledgeManager, err := knowledge.NewManager()
+	if err != nil {
+		slog.Warn("Knowledge manager unavailable (Qdrant not running?)", "error", err)
+		knowledgeManager = nil
+	}
+
+	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, knowledgeManager, daemonHub)
 	if opts.DaemonWakeup != nil {
 		h.TaskService.Wakeup = opts.DaemonWakeup
 	}
@@ -530,12 +538,21 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Post("/{id}/archive", h.ArchiveInboxItem)
 			})
 
-			// Notification preferences
-			r.Route("/api/notification-preferences", func(r chi.Router) {
-				r.Get("/", h.GetNotificationPreferences)
-				r.Put("/", h.UpdateNotificationPreferences)
-			})
+		// Notification preferences
+		r.Route("/api/notification-preferences", func(r chi.Router) {
+			r.Get("/", h.GetNotificationPreferences)
+			r.Put("/", h.UpdateNotificationPreferences)
 		})
+
+		// Knowledge sources
+		r.Route("/api/knowledge", func(r chi.Router) {
+			r.Get("/sources", h.ListKnowledgeSources)
+			r.Post("/sources", h.CreateKnowledgeSource)
+			r.Delete("/sources/{id}", h.DeleteKnowledgeSource)
+			r.Post("/sources/{id}/sync", h.SyncKnowledgeSource)
+			r.Post("/search", h.SearchKnowledge)
+		})
+	})
 	})
 
 	return r
