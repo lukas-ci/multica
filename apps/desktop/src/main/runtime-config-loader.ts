@@ -15,7 +15,15 @@ export async function loadRuntimeConfig(options: {
   env: RuntimeConfigEnv;
   configPath?: string;
 }): Promise<RuntimeConfigResult> {
-  if (options.isDev) {
+  if (options.isDev && !options.env.apiUrl) {
+    const devConfigPath = options.configPath ?? desktopConfigPath();
+    try {
+      const raw = await readFile(devConfigPath, "utf-8");
+      const config = parseRuntimeConfig(raw);
+      if (config.apiUrl) {
+        return { ok: true, config };
+      }
+    } catch { /* fall through to dev env */ }
     try {
       return { ok: true, config: runtimeConfigFromDevEnv(options.env) };
     } catch (err) {
