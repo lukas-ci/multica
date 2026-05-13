@@ -33,7 +33,9 @@ func NewQdrantStore(url string, dimension int) (*QdrantStore, error) {
 }
 
 func collectionName(workspaceID string) string {
-	return "ws_" + workspaceID
+	// Qdrant collection names must be valid UTF-8, no hyphens in UUIDs
+	id := strings.ReplaceAll(workspaceID, "-", "")
+	return "ws_" + id
 }
 
 func (s *QdrantStore) ensureCollection(ctx context.Context, workspaceID string) error {
@@ -79,7 +81,7 @@ func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []C
 			"synced_at":    {Kind: &qdrantpb.Value_StringValue{StringValue: time.Now().UTC().Format(time.RFC3339)}},
 		}
 		points[i] = &qdrantpb.PointStruct{
-			Id:      &qdrantpb.PointId{PointIdOptions: &qdrantpb.PointId_Uuid{Uuid: generateChunkID(c)}},
+			Id:      &qdrantpb.PointId{PointIdOptions: &qdrantpb.PointId_Num{Num: uint64(i)}},
 			Vectors: &qdrantpb.Vectors{VectorsOptions: &qdrantpb.Vectors_Vector{Vector: &qdrantpb.Vector{Data: vectors[i]}}},
 			Payload: payload,
 		}

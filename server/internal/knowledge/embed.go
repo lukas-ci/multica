@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-var embedHTTPClient = &http.Client{Timeout: 60 * time.Second}
+var embedHTTPClient = &http.Client{Timeout: 120 * time.Second}
 
 type Embedder interface {
 	Embed(texts []string) ([][]float32, error)

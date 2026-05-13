@@ -216,7 +216,11 @@ export function KnowledgePage() {
   }, []);
 
   const handleRemove = async (id: string) => {
-    await api.request(`/api/knowledge/sources/${id}`, { method: "DELETE" });
+    try {
+      await api.request(`/api/knowledge/sources/${id}`, { method: "DELETE" });
+    } catch {
+      // delete failed, still refresh
+    }
     fetchSources();
   };
 
