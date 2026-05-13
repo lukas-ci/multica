@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -115,9 +117,10 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	sourceID := uuidToString(id)
 	sourceIDStr := sourceID
 
-	// Auto-trigger sync in background
+	// Auto-trigger sync in background (use background context — request context is cancelled after response)
 	go func() {
-		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
 		h.syncKnowledgeSource(ctx, parseUUID(workspaceID), parseUUID(sourceIDStr), req.SourceType, req.Config)
 	}()
 
@@ -175,12 +178,18 @@ func (h *Handler) syncKnowledgeSource(ctx context.Context, wsUUID, srcUUID pgtyp
 	}
 
 	workspaceID := uuidToString(wsUUID)
-	chunks, err := connector.Fetch(workspaceID, string(configJSON))
+	chunks, err := connector.Fetch(ctx, workspaceID, string(configJSON))
 	if err != nil {
 		slog.Warn("syncKnowledgeSource fetch failed", "error", err)
 		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
 		return
 	}
+	if len(chunks) == 0 {
+		slog.Warn("syncKnowledgeSource fetch returned 0 chunks", "source_type", sourceType)
+		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'no content found in source' WHERE id = $1`, srcUUID)
+		return
+	}
+	slog.Info("syncKnowledgeSource chunks fetched", "count", len(chunks))
 	if err := h.KnowledgeManager.IndexChunks(ctx, workspaceID, chunks); err != nil {
 		slog.Warn("syncKnowledgeSource index failed", "error", err)
 		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
@@ -223,11 +232,12 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run sync in background
-	go h.syncKnowledgeSource(r.Context(), wsUUID, srcUUID, sourceType, configJSON)
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
-}
+	// Run sync in background (use background context — request context is cancelled after response)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		h.syncKnowledgeSource(ctx, wsUUID, srcUUID, sourceType, configJSON)
+	}()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
 }

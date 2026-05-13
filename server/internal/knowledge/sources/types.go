@@ -1,9 +1,13 @@
 package sources
 
-import "github.com/multica-ai/multica/server/internal/knowledge"
+import (
+	"context"
+
+	"github.com/multica-ai/multica/server/internal/knowledge"
+)
 
 type Connector interface {
-	Fetch(workspaceID, configJSON string) ([]knowledge.Chunk, error)
+	Fetch(ctx context.Context, workspaceID, configJSON string) ([]knowledge.Chunk, error)
 	SourceType() knowledge.SourceType
 }
 

@@ -2,11 +2,14 @@ package sources
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/multica-ai/multica/server/internal/knowledge"
 )
@@ -14,6 +17,7 @@ import (
 type ConfluenceConfig struct {
 	BaseURL  string `json:"base_url"`
 	Token    string `json:"token"`
+	Email    string `json:"email"`
 	SpaceKey string `json:"space_key"`
 }
 
@@ -43,7 +47,7 @@ type confluenceSearchResult struct {
 	} `json:"_links"`
 }
 
-func (c *ConfluenceConnector) Fetch(workspaceID, configJSON string) ([]knowledge.Chunk, error) {
+func (c *ConfluenceConnector) Fetch(ctx context.Context, workspaceID, configJSON string) ([]knowledge.Chunk, error) {
 	var cfg ConfluenceConfig
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -55,11 +59,15 @@ func (c *ConfluenceConnector) Fetch(workspaceID, configJSON string) ([]knowledge
 	}
 
 	var allChunks []knowledge.Chunk
-	nextURL := fmt.Sprintf("%s/rest/api/content?spaceKey=%s&expand=body.storage&limit=25", cfg.BaseURL, cfg.SpaceKey)
+	nextURL := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&expand=body.storage&limit=25", cfg.BaseURL, cfg.SpaceKey)
 
 	for nextURL != "" {
-		req, _ := http.NewRequest("GET", nextURL, nil)
-		req.Header.Set("Authorization", "Bearer "+cfg.Token)
+		req, _ := http.NewRequestWithContext(ctx, "GET", nextURL, nil)
+		email := cfg.Email
+		if email == "" {
+			email = "lukas.hu@instacart.com"
+		}
+		req.SetBasicAuth(email, cfg.Token)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("confluence fetch: %w", err)
@@ -79,16 +87,13 @@ func (c *ConfluenceConnector) Fetch(workspaceID, configJSON string) ([]knowledge
 		}
 
 		nextURL = result.Links.Next
-		if nextURL != "" && !startsWithHTTP(nextURL) {
-			nextURL = cfg.BaseURL + nextURL
+		if nextURL != "" && !strings.HasPrefix(nextURL, "http") {
+			nextURL = cfg.BaseURL + "/wiki" + nextURL
 		}
 	}
 
+	slog.Info("Confluence fetch complete", "space", cfg.SpaceKey, "chunks", len(allChunks))
 	return allChunks, nil
-}
-
-func startsWithHTTP(s string) bool {
-	return len(s) >= 4 && s[:4] == "http"
 }
 
 type unstructuredRequest struct {
@@ -102,46 +107,82 @@ type unstructuredElement struct {
 }
 
 func chunkWithUnstructured(baseURL string, page confluencePage, workspaceID, spaceKey string) ([]knowledge.Chunk, error) {
-	reqBody, _ := json.Marshal(unstructuredRequest{
-		Filename: page.ID + ".html",
-		Content:  page.Body.Storage.Value,
-	})
-	resp, err := http.Post(baseURL+"/general/v0/general", "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, err
+	// Strip HTML tags and chunk by word count directly.
+	// No external Unstructured dependency needed for text extraction.
+	text := stripHTML(page.Body.Storage.Value)
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
 
-	var elements []unstructuredElement
-	json.Unmarshal(respBody, &elements)
-
+	words := strings.Fields(text)
+	const chunkWords = 500
 	var chunks []knowledge.Chunk
-	var buf string
-	wordCount := 0
-	chunkIdx := 0
 
-	for _, el := range elements {
-		if el.Text == "" {
-			continue
+	for i := 0; i < len(words); i += chunkWords {
+		end := i + chunkWords
+		if end > len(words) {
+			end = len(words)
 		}
-		buf += el.Text + "\n"
-		wordCount += countWords(el.Text)
-		if wordCount >= 500 {
-			chunks = append(chunks, makeChunk(buf, page, workspaceID, spaceKey, chunkIdx, 0))
-			buf = ""
-			wordCount = 0
-			chunkIdx++
-		}
+		chunkText := strings.Join(words[i:end], " ")
+		chunks = append(chunks, makeChunk(chunkText, page, workspaceID, spaceKey, len(chunks), 0))
 	}
-	if buf != "" {
-		chunks = append(chunks, makeChunk(buf, page, workspaceID, spaceKey, chunkIdx, 0))
-	}
+
 	for i := range chunks {
 		chunks[i].TotalChunks = len(chunks)
 	}
 
 	return chunks, nil
+}
+
+func stripHTML(html string) string {
+	// Remove HTML tags, scripts, styles
+	b := []byte(html)
+	var out strings.Builder
+	inTag := false
+	inScript := false
+	inStyle := false
+	for i := 0; i < len(b); i++ {
+		if !inTag && !inScript && !inStyle && b[i] == '<' {
+			if len(b) > i+6 && bytes.EqualFold(b[i+1:i+7], []byte("script")) {
+				inScript = true
+				continue
+			}
+			if len(b) > i+5 && bytes.EqualFold(b[i+1:i+6], []byte("style")) {
+				inStyle = true
+				continue
+			}
+			if len(b) > i+2 && b[i+1] == '/' {
+				// Closing tag — skip
+			}
+			inTag = true
+			continue
+		}
+		if inTag && b[i] == '>' {
+			inTag = false
+			if !inScript && !inStyle {
+				out.WriteByte(' ')
+			}
+			continue
+		}
+		if inScript && b[i] == '<' && len(b) > i+8 && bytes.EqualFold(b[i+1:i+9], []byte("/script>")) {
+			inScript = false
+			inTag = false
+			out.WriteByte(' ')
+			i += 8
+			continue
+		}
+		if inStyle && b[i] == '<' && len(b) > i+7 && bytes.EqualFold(b[i+1:i+8], []byte("/style>")) {
+			inStyle = false
+			inTag = false
+			out.WriteByte(' ')
+			i += 7
+			continue
+		}
+		if !inTag && !inScript && !inStyle {
+			out.WriteByte(b[i])
+		}
+	}
+	return out.String()
 }
 
 func makeChunk(text string, page confluencePage, workspaceID, spaceKey string, idx, total int) knowledge.Chunk {

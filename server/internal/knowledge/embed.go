@@ -7,7 +7,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 )
+
+var embedHTTPClient = &http.Client{Timeout: 60 * time.Second}
 
 type Embedder interface {
 	Embed(texts []string) ([][]float32, error)
@@ -39,7 +42,7 @@ func (e *AIGWEmbedder) Embed(texts []string) ([][]float32, error) {
 	if e.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+e.APIKey)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := embedHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embed request: %w", err)
 	}
@@ -77,7 +80,7 @@ type ollamaEmbedResponse struct {
 func (e *OllamaEmbedder) Embed(texts []string) ([][]float32, error) {
 	reqBody := ollamaEmbedRequest{Model: e.Model, Input: texts}
 	body, _ := json.Marshal(reqBody)
-	resp, err := http.Post(e.BaseURL+"/api/embed", "application/json", bytes.NewReader(body))
+	resp, err := embedHTTPClient.Post(e.BaseURL+"/api/embed", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("ollama embed: %w", err)
 	}

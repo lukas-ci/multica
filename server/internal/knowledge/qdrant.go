@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -19,6 +20,7 @@ type QdrantStore struct {
 }
 
 func NewQdrantStore(url string, dimension int) (*QdrantStore, error) {
+	url = strings.TrimPrefix(url, "grpc://")
 	conn, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("qdrant connect: %w", err)
