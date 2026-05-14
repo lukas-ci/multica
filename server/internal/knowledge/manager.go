@@ -39,13 +39,24 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 }
 
 func (m *Manager) IndexChunks(ctx context.Context, workspaceID string, chunks []Chunk) error {
-	texts := make([]string, len(chunks))
-	for i, c := range chunks {
-		texts[i] = c.Text
+	const batchSize = 20
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batch := chunks[i:end]
+		texts := make([]string, len(batch))
+		for j, c := range batch {
+			texts[j] = c.Text
+		}
+		vectors, err := m.embedder.Embed(texts)
+		if err != nil {
+			return err
+		}
+		if err := m.store.Upsert(ctx, workspaceID, batch, vectors, i); err != nil {
+			return err
+		}
 	}
-	vectors, err := m.embedder.Embed(texts)
-	if err != nil {
-		return err
-	}
-	return m.store.Upsert(ctx, workspaceID, chunks, vectors)
+	return nil
 }

@@ -2136,6 +2136,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		customArgs = task.Agent.CustomArgs
 		mcpConfig = task.Agent.McpConfig
 	}
+	// Framework-level: auto-inject knowledge_search MCP tool if the
+	// backend has the knowledge service enabled. Merges into any
+	// existing agent-level MCP config so agents always discover it.
+	if baseURL := os.Getenv("MULTICA_KNOWLEDGE_MCP_URL"); baseURL != "" {
+		mcpConfig = mergeKnowledgeMCP(mcpConfig, baseURL, task.WorkspaceID)
+	}
 	// Two-tier model resolution: an explicit agent.model wins,
 	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
 	// both are empty we deliberately pass "" through — each

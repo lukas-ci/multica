@@ -15,7 +15,18 @@ export async function loadRuntimeConfig(options: {
   env: RuntimeConfigEnv;
   configPath?: string;
 }): Promise<RuntimeConfigResult> {
-  if (options.isDev && !options.env.apiUrl) {
+  if (options.isDev) {
+    if (options.env.apiUrl) {
+      // VITE_API_URL is set at build time — use it directly, skip desktop.json.
+      // This allows the source-built Canary to use a baked-in LAN backend
+      // while the DMG app reads desktop.json for its own backend independently.
+      try {
+        return { ok: true, config: runtimeConfigFromDevEnv(options.env) };
+      } catch (err) {
+        return { ok: false, error: { message: errorMessage(err) } };
+      }
+    }
+    // No VITE_API_URL — try desktop.json first, fall back to dev defaults.
     const devConfigPath = options.configPath ?? desktopConfigPath();
     try {
       const raw = await readFile(devConfigPath, "utf-8");
