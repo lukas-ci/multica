@@ -65,6 +65,8 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	args = append(args, filterCustomArgs(opts.CustomArgs, opencodeBlockedArgs, b.cfg.Logger)...)
 	args = append(args, prompt)
 
+	b.writeOpenCodeMcpConfig(opts.Cwd, opts.McpConfig)
+
 	cmd := exec.CommandContext(runCtx, execPath, args...)
 	hideAgentWindow(cmd)
 	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
@@ -428,4 +430,69 @@ func (e *opencodeError) Message() string {
 
 type opencodeErrData struct {
 	Message string `json:"message,omitempty"`
+}
+
+func (b *opencodeBackend) writeOpenCodeMcpConfig(cwd string, mcpConfig json.RawMessage) {
+	if len(mcpConfig) == 0 {
+		return
+	}
+	opencodeDir := filepath.Join(cwd, ".opencode")
+	if err := os.MkdirAll(opencodeDir, 0755); err != nil {
+		b.cfg.Logger.Warn("opencode: failed to create .opencode dir for MCP config", "error", err)
+		return
+	}
+	cfg := make(map[string]interface{})
+	var wrapper map[string]interface{}
+	if err := json.Unmarshal(mcpConfig, &wrapper); err != nil {
+		b.cfg.Logger.Warn("opencode: failed to unmarshal MCP config", "error", err)
+		return
+	}
+	mcpServers, ok := wrapper["mcpServers"]
+	if !ok {
+		return
+	}
+	servers, ok := mcpServers.(map[string]interface{})
+	if !ok {
+		return
+	}
+	opencodeMcp := make(map[string]interface{})
+	for name, srv := range servers {
+		srvMap, ok := srv.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		entry := map[string]interface{}{
+			"enabled": true,
+		}
+		if cmd, ok := srvMap["command"].(string); ok {
+			var cmdArgs []string
+			if a, ok := srvMap["args"].([]interface{}); ok {
+				for _, arg := range a {
+					if s, ok := arg.(string); ok {
+						cmdArgs = append(cmdArgs, s)
+					}
+				}
+			}
+			entry["command"] = append([]string{cmd}, cmdArgs...)
+		}
+		if env, ok := srvMap["env"]; ok {
+			entry["env"] = env
+		}
+		opencodeMcp[name] = entry
+	}
+	if len(opencodeMcp) == 0 {
+		return
+	}
+	cfg["mcp"] = opencodeMcp
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		b.cfg.Logger.Warn("opencode: failed to marshal MCP config", "error", err)
+		return
+	}
+	configPath := filepath.Join(opencodeDir, "opencode.json")
+	if err := os.WriteFile(configPath, raw, 0644); err != nil {
+		b.cfg.Logger.Warn("opencode: failed to write MCP config", "path", configPath, "error", err)
+		return
+	}
+	b.cfg.Logger.Debug("opencode: wrote per-task MCP config", "path", configPath)
 }
