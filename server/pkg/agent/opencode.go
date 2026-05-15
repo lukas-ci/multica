@@ -78,7 +78,38 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	env := buildEnv(b.cfg.Env)
 	// Auto-approve all tool use in daemon mode.
 	env = append(env, `OPENCODE_PERMISSION={"*":"allow"}`)
+	// Inject MCP config via env var so even resumed sessions discover
+	// platform tools like knowledge_search.
+	if len(opts.McpConfig) > 0 {
+		mcpRaw, _ := json.Marshal(map[string]interface{}{"mcp": extractMcpServers(opts.McpConfig)})
+		if len(mcpRaw) > 10 {
+			env = append(env, "OPENCODE_CONFIG_CONTENT="+string(mcpRaw))
+			b.cfg.Logger.Debug("opencode: set OPENCODE_CONFIG_CONTENT", "len", len(mcpRaw))
+		} else {
+			b.cfg.Logger.Debug("opencode: OPENCODE_CONFIG_CONTENT not set (mcpRaw too short)", "len", len(mcpRaw))
+		}
+	} else {
+		b.cfg.Logger.Debug("opencode: McpConfig is empty, skipping OPENCODE_CONFIG_CONTENT")
+	}
 	cmd.Env = env
+
+	// Blocking exec path: use CombinedOutput instead of StdoutPipe.
+	// Avoids pipe buffering issues that can cause tool_use events to be
+	// invisible to the daemon's streaming parser. Controlled by
+	// MULTICA_OPENCODE_BLOCKING_EXEC env var or ExecOptions.UseBlockingExec.
+	if opts.UseBlockingExec {
+		result, err := b.runBlocking(cmd, opts)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		msgCh := make(chan Message, 1)
+		resCh := make(chan Result, 1)
+		resCh <- *result
+		close(resCh)
+		close(msgCh)
+		return &Session{Messages: msgCh, Result: resCh}, nil
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -177,24 +208,23 @@ func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventRes
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		line := scanner.Bytes()
+		if len(line) == 0 {
 			continue
 		}
-
 		var event opencodeEvent
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
+		if err := json.Unmarshal(line, &event); err != nil {
+			// First 200 chars of the offending line for debug
+			preview := string(line)
+			if len(preview) > 200 {
+				preview = preview[:200]
+			}
+			b.cfg.Logger.Debug("opencode: skip non-JSON line", "preview", preview)
 			continue
 		}
-
-		if event.SessionID != "" {
-			sessionID = event.SessionID
-		}
-
 		switch event.Type {
-		case "text":
-			b.handleTextEvent(event, ch, &output)
 		case "tool_use":
+			b.cfg.Logger.Debug("opencode: received tool_use event", "tool", event.Part.Tool)
 			b.handleToolUseEvent(event, ch)
 		case "error":
 			b.handleErrorEvent(event, ch, &finalStatus, &finalError)
@@ -432,8 +462,54 @@ type opencodeErrData struct {
 	Message string `json:"message,omitempty"`
 }
 
+// extractMcpServers extracts the MCP servers map from a json.RawMessage
+// containing {"mcpServers": {...}} and converts to opencode format:
+// {"name": {"command": [...], "enabled": true, ...}}.
+func extractMcpServers(raw json.RawMessage) map[string]interface{} {
+	var wrapper map[string]interface{}
+	if err := json.Unmarshal(raw, &wrapper); err != nil {
+		return nil
+	}
+	mcpServers, ok := wrapper["mcpServers"]
+	if !ok {
+		return nil
+	}
+	servers, ok := mcpServers.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	result := make(map[string]interface{})
+	for name, srv := range servers {
+		srvMap, ok := srv.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		entry := map[string]interface{}{"enabled": true}
+		if cmd, ok := srvMap["command"].(string); ok {
+			var args []string
+			if a, ok := srvMap["args"].([]interface{}); ok {
+				for _, arg := range a {
+					if s, ok := arg.(string); ok {
+						args = append(args, s)
+					}
+				}
+			}
+			entry["command"] = append([]string{cmd}, args...)
+		}
+		if env, ok := srvMap["env"]; ok {
+			entry["env"] = env
+		}
+		result[name] = entry
+	}
+	return result
+}
+
 func (b *opencodeBackend) writeOpenCodeMcpConfig(cwd string, mcpConfig json.RawMessage) {
 	if len(mcpConfig) == 0 {
+		return
+	}
+	opencodeMcp := extractMcpServers(mcpConfig)
+	if len(opencodeMcp) == 0 {
 		return
 	}
 	opencodeDir := filepath.Join(cwd, ".opencode")
@@ -441,49 +517,7 @@ func (b *opencodeBackend) writeOpenCodeMcpConfig(cwd string, mcpConfig json.RawM
 		b.cfg.Logger.Warn("opencode: failed to create .opencode dir for MCP config", "error", err)
 		return
 	}
-	cfg := make(map[string]interface{})
-	var wrapper map[string]interface{}
-	if err := json.Unmarshal(mcpConfig, &wrapper); err != nil {
-		b.cfg.Logger.Warn("opencode: failed to unmarshal MCP config", "error", err)
-		return
-	}
-	mcpServers, ok := wrapper["mcpServers"]
-	if !ok {
-		return
-	}
-	servers, ok := mcpServers.(map[string]interface{})
-	if !ok {
-		return
-	}
-	opencodeMcp := make(map[string]interface{})
-	for name, srv := range servers {
-		srvMap, ok := srv.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		entry := map[string]interface{}{
-			"enabled": true,
-		}
-		if cmd, ok := srvMap["command"].(string); ok {
-			var cmdArgs []string
-			if a, ok := srvMap["args"].([]interface{}); ok {
-				for _, arg := range a {
-					if s, ok := arg.(string); ok {
-						cmdArgs = append(cmdArgs, s)
-					}
-				}
-			}
-			entry["command"] = append([]string{cmd}, cmdArgs...)
-		}
-		if env, ok := srvMap["env"]; ok {
-			entry["env"] = env
-		}
-		opencodeMcp[name] = entry
-	}
-	if len(opencodeMcp) == 0 {
-		return
-	}
-	cfg["mcp"] = opencodeMcp
+	cfg := map[string]interface{}{"mcp": opencodeMcp}
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		b.cfg.Logger.Warn("opencode: failed to marshal MCP config", "error", err)
@@ -491,8 +525,102 @@ func (b *opencodeBackend) writeOpenCodeMcpConfig(cwd string, mcpConfig json.RawM
 	}
 	configPath := filepath.Join(opencodeDir, "opencode.json")
 	if err := os.WriteFile(configPath, raw, 0644); err != nil {
-		b.cfg.Logger.Warn("opencode: failed to write MCP config", "path", configPath, "error", err)
+		b.cfg.Logger.Warn("opencode: failed to write MCP config", "error", err)
 		return
 	}
 	b.cfg.Logger.Debug("opencode: wrote per-task MCP config", "path", configPath)
+}
+
+// runBlocking runs opencode via CombinedOutput — no pipes, no goroutines,
+// no streaming. Parses all output after the process exits. Slower but
+// avoids the StdoutPipe buffering / event-loss issues seen with MCP tools.
+func (b *opencodeBackend) runBlocking(cmd *exec.Cmd, opts ExecOptions) (*Result, error) {
+	start := time.Now()
+	raw, err := cmd.CombinedOutput()
+	dur := time.Since(start)
+
+	var stderr string
+	var exitErr *exec.ExitError
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			exitErr = ee
+			stderr = string(ee.Stderr)
+		} else {
+			return nil, fmt.Errorf("opencode: %w", err)
+		}
+	}
+
+	b.cfg.Logger.Info("opencode [blocking] finished", "duration", dur.Round(time.Millisecond).String(), "bytes", len(raw), "exitError", exitErr)
+	if len(raw) == 0 {
+		// Diagnostic: run a simple test to verify CombinedOutput works from this process
+		testCmd := exec.Command("echo", "hello_from_daemon")
+		testOut, _ := testCmd.CombinedOutput()
+		b.cfg.Logger.Warn("opencode [blocking] produced zero output",
+			"dir", cmd.Dir,
+			"envCount", len(cmd.Env),
+			"canExec", len(testOut) > 0,
+		)
+	}
+
+	// Parse events from raw output (same format as streaming parser)
+	lines := strings.Split(string(raw), "\n")
+	var output strings.Builder
+	var toolCount int
+	var usage TokenUsage
+	var sessionID string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var event opencodeEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			continue
+		}
+		switch event.Type {
+		case "text":
+			output.WriteString(event.Part.Text)
+			if event.SessionID != "" {
+				sessionID = event.SessionID
+			}
+		case "tool_use":
+			toolCount++
+		case "step_finish":
+			if event.Part.Tokens != nil {
+				usage.InputTokens += event.Part.Tokens.Input
+				usage.OutputTokens += event.Part.Tokens.Output
+				usage.CacheReadTokens += event.Part.Tokens.Cache.Read
+				usage.CacheWriteTokens += event.Part.Tokens.Cache.Write
+			}
+		}
+	}
+
+	status := "completed"
+	errMsg := ""
+	if exitErr != nil {
+		status = "failed"
+		errMsg = fmt.Sprintf("opencode exited with error: %v", exitErr)
+		if stderr != "" {
+			errMsg += "; stderr: " + stderr
+		}
+	}
+
+	var u map[string]TokenUsage
+	if usage.InputTokens > 0 || usage.OutputTokens > 0 {
+		model := opts.Model
+		if model == "" {
+			model = "unknown"
+		}
+		u = map[string]TokenUsage{model: usage}
+	}
+
+	return &Result{
+		Status:     status,
+		Output:     output.String(),
+		Error:      errMsg,
+		ToolCount:  toolCount,
+		DurationMs: dur.Milliseconds(),
+		SessionID:  sessionID,
+		Usage:      u,
+	}, nil
 }

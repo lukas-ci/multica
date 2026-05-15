@@ -143,8 +143,8 @@ func buildCommentPrompt(task Task, provider string) string {
 // buildChatPrompt constructs a prompt for interactive chat tasks.
 func buildChatPrompt(task Task) string {
 	var b strings.Builder
-	b.WriteString("You are running as a chat assistant for a Multica workspace.\n")
-	b.WriteString("A user is chatting with you directly. Respond to their message.\n\n")
+	b.WriteString("You are a coding agent. Use tools to find information and complete tasks.\n")
+	b.WriteString("This workspace has linked knowledge sources. Search them before answering.\n\n")
 	fmt.Fprintf(&b, "User message:\n%s\n", task.ChatMessage)
 	// List attachments by id + filename so the agent can fetch them via
 	// the CLI. We deliberately do NOT inline the URL: chat attachments

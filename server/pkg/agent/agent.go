@@ -32,6 +32,7 @@ type ExecOptions struct {
 	ExtraArgs                 []string        // daemon-wide default CLI arguments appended before CustomArgs; currently read by claude and codex backends only
 	CustomArgs                []string        // per-agent CLI arguments appended after ExtraArgs
 	McpConfig                 json.RawMessage // if non-nil, MCP server config to pass via --mcp-config
+	UseBlockingExec           bool             // if true, use CombinedOutput (no pipe, no streaming)
 }
 
 // Session represents a running agent execution.
@@ -82,6 +83,7 @@ type Result struct {
 	Status     string // "completed", "failed", "aborted", "timeout", "cancelled"
 	Output     string // accumulated text output
 	Error      string // error message if failed
+	ToolCount  int    // number of tool_use events
 	DurationMs int64
 	SessionID  string
 	Usage      map[string]TokenUsage // keyed by model name

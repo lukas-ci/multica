@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/multica-ai/multica/server/internal/knowledge"
+	"github.com/multica-ai/multica/server/internal/middleware"
 )
 
 type mcpRequest struct {
@@ -83,7 +84,7 @@ func (h *Handler) mcpCallTool(w http.ResponseWriter, r *http.Request, req mcpReq
 		return
 	}
 
-	workspaceID, _ := r.Context().Value("workspace_id").(string)
+	workspaceID := middleware.WorkspaceIDFromContext(r.Context())
 	query, _ := params.Arguments["query"].(string)
 	limit := 10
 	if l, ok := params.Arguments["limit"].(float64); ok {

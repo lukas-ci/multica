@@ -2167,6 +2167,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		ExtraArgs:                 extraArgs,
 		CustomArgs:                customArgs,
 		McpConfig:                 mcpConfig,
+		UseBlockingExec:           os.Getenv("MULTICA_OPENCODE_BLOCKING_EXEC") != "",
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // mergeKnowledgeMCP merges the knowledge MCP server config into an existing
@@ -14,13 +15,19 @@ func mergeKnowledgeMCP(existing json.RawMessage, baseURL, workspaceID string) js
 	// Find the script: look alongside the multica binary directory
 	scriptPath := resolveKnowledgeScript()
 
+	// Read PAT from the daemon's Multica config for API auth
+	pat := readMulticaToken()
+	envVars := map[string]string{
+		"MULTICA_API_URL":        strings.TrimSuffix(baseURL, "/api/mcp"),
+		"MULTICA_WORKSPACE_SLUG": workspaceID,
+	}
+	if pat != "" {
+		envVars["MULTICA_AUTH_TOKEN"] = pat
+	}
 	ks := map[string]interface{}{
 		"command": "node",
 		"args":    []string{scriptPath},
-		"env": map[string]string{
-			"MULTICA_API_URL":        baseURL,
-			"MULTICA_WORKSPACE_SLUG": workspaceID,
-		},
+		"env":     envVars,
 	}
 
 	// Try to parse existing config as {"mcpServers": {...}}
@@ -36,13 +43,29 @@ func mergeKnowledgeMCP(existing json.RawMessage, baseURL, workspaceID string) js
 		}
 	}
 
-	servers["multica-knowledge"] = ks
+	servers["knowledge"] = ks
 
 	result, err := json.Marshal(map[string]interface{}{"mcpServers": servers})
 	if err != nil {
 		return existing
 	}
 	return result
+}
+
+func readMulticaToken() string {
+	home, _ := os.UserHomeDir()
+	configPath := filepath.Join(home, ".multica", "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	var config struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	return config.Token
 }
 
 func resolveKnowledgeScript() string {
