@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -68,6 +69,9 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 	if cfg.SpaceKey == "" {
 		return nil, fmt.Errorf("confluence config: space_key is required")
 	}
+	if cfg.Token == "" {
+		return nil, fmt.Errorf("confluence config: token is required")
+	}
 
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
 
@@ -76,6 +80,8 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 		decoded, err := url.QueryUnescape(cursor)
 		if err == nil {
 			reqURL = decoded
+		} else {
+			slog.Warn("confluence fetch: failed to decode cursor, starting from page 1", "cursor", cursor, "error", err)
 		}
 	}
 
