@@ -162,6 +162,31 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Get space key from config before deleting the row
+	var configJSON json.RawMessage
+	err := h.DB.QueryRow(r.Context(), `
+		SELECT config FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
+	`, srcUUID, wsUUID).Scan(&configJSON)
+	if err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, "knowledge source not found")
+			return
+		}
+		slog.Warn("DeleteKnowledgeSource lookup failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to read knowledge source")
+		return
+	}
+
+	// Parse config to extract source_id (space_key for Confluence)
+	var sourceIDInQdrant string
+	var cfg struct {
+		SpaceKey string `json:"space_key"`
+	}
+	if err := json.Unmarshal(configJSON, &cfg); err == nil && cfg.SpaceKey != "" {
+		sourceIDInQdrant = cfg.SpaceKey
+	}
+
+	// Delete DB row
 	result, err := h.DB.Exec(r.Context(), `
 		DELETE FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
 	`, srcUUID, wsUUID)
@@ -175,9 +200,10 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if h.KnowledgeManager != nil {
-		if err := h.KnowledgeManager.DropCollection(r.Context(), workspaceID); err != nil {
-			slog.Warn("KnowledgeManager.DropCollection failed", "workspace_id", workspaceID, "error", err)
+	// Delete Qdrant points for this source
+	if h.KnowledgeManager != nil && sourceIDInQdrant != "" {
+		if err := h.KnowledgeManager.DeleteSourcePoints(r.Context(), workspaceID, sourceIDInQdrant); err != nil {
+			slog.Warn("DeleteKnowledgeSource: DeleteSourcePoints failed", "workspace_id", workspaceID, "source_id", sourceIDInQdrant, "error", err)
 		}
 	}
 
@@ -197,12 +223,21 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.KnowledgeManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "knowledge search is not available (Qdrant not configured)")
+		return
+	}
+	if h.WorkerManager == nil {
+		writeError(w, http.StatusInternalServerError, "sync queue is not available")
+		return
+	}
+
 	var sourceType string
-	var configJSON json.RawMessage
+	var syncStatus string
 	err := h.DB.QueryRow(r.Context(), `
-		SELECT source_type, config FROM knowledge_sources
+		SELECT source_type, sync_status FROM knowledge_sources
 		WHERE id = $1 AND workspace_id = $2
-	`, srcUUID, wsUUID).Scan(&sourceType, &configJSON)
+	`, srcUUID, wsUUID).Scan(&sourceType, &syncStatus)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "knowledge source not found")
@@ -213,22 +248,32 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.KnowledgeManager == nil {
-		writeError(w, http.StatusServiceUnavailable, "knowledge search is not available (Qdrant not configured)")
+	if syncStatus == "syncing" {
+		writeError(w, http.StatusConflict, "sync already in progress")
 		return
 	}
 
-	if h.WorkerManager != nil {
-		h.DB.Exec(r.Context(), `UPDATE knowledge_sources SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full' WHERE id = $1`, srcUUID)
-		if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
-			SourceID:    sourceID,
-			WorkspaceID: workspaceID,
-			SyncKind:    string(knowledge.SyncFull),
-		}); err != nil {
-			slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
-			writeError(w, http.StatusInternalServerError, "failed to start sync")
-			return
-		}
+	// Reset sync state
+	_, err = h.DB.Exec(r.Context(), `
+		UPDATE knowledge_sources
+		SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full'
+		WHERE id = $1
+	`, srcUUID)
+	if err != nil {
+		slog.Warn("SyncKnowledgeSource: failed to reset sync state", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to reset sync state")
+		return
+	}
+
+	// Enqueue sync job
+	if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
+		SourceID:    sourceID,
+		WorkspaceID: workspaceID,
+		SyncKind:    string(knowledge.SyncFull),
+	}); err != nil {
+		slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to start sync")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
