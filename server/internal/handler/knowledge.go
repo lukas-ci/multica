@@ -153,6 +153,10 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	sourceID := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
 
+	if _, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found"); !ok {
+		return
+	}
+
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
 	if !ok {
 		return
@@ -214,6 +218,10 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 	sourceID := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
 
+	if _, ok := h.requireWorkspaceMember(w, r, workspaceID, "workspace not found"); !ok {
+		return
+	}
+
 	wsUUID, ok := parseUUIDOrBadRequest(w, workspaceID, "workspace id")
 	if !ok {
 		return
@@ -253,19 +261,7 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reset sync state
-	_, err = h.DB.Exec(r.Context(), `
-		UPDATE knowledge_sources
-		SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full'
-		WHERE id = $1
-	`, srcUUID)
-	if err != nil {
-		slog.Warn("SyncKnowledgeSource: failed to reset sync state", append(logger.RequestAttrs(r), "error", err)...)
-		writeError(w, http.StatusInternalServerError, "failed to reset sync state")
-		return
-	}
-
-	// Enqueue sync job
+	// Enqueue first, reset on success (avoids orphaned state if enqueue fails)
 	if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
 		SourceID:    sourceID,
 		WorkspaceID: workspaceID,
@@ -274,6 +270,15 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to start sync")
 		return
+	}
+
+	_, err = h.DB.Exec(r.Context(), `
+		UPDATE knowledge_sources
+		SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full'
+		WHERE id = $1
+	`, srcUUID)
+	if err != nil {
+		slog.Warn("SyncKnowledgeSource: failed to reset sync state", append(logger.RequestAttrs(r), "error", err)...)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
