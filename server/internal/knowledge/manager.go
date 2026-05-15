@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"fmt"
 	"os"
 )
 
@@ -61,6 +62,9 @@ func (m *Manager) IndexChunks(ctx context.Context, workspaceID string, chunks []
 		vectors, err := m.embedder.Embed(texts)
 		if err != nil {
 			return err
+		}
+		if len(vectors) != len(batch) {
+			return fmt.Errorf("IndexChunks: embedder returned %d vectors for %d chunks", len(vectors), len(batch))
 		}
 		if err := m.store.Upsert(ctx, workspaceID, batch, vectors); err != nil {
 			return err

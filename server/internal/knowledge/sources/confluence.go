@@ -165,7 +165,8 @@ func chunkPage(page confluencePage, workspaceID, spaceKey string) []knowledge.Ch
 	}
 
 	words := strings.Fields(text)
-	const chunkWords = 500
+	const chunkWords = 300
+	const maxChunkChars = 12000
 	var chunks []knowledge.Chunk
 
 	for i := 0; i < len(words); i += chunkWords {
@@ -174,6 +175,9 @@ func chunkPage(page confluencePage, workspaceID, spaceKey string) []knowledge.Ch
 			end = len(words)
 		}
 		chunkText := strings.Join(words[i:end], " ")
+		if len(chunkText) > maxChunkChars {
+			chunkText = chunkText[:maxChunkChars]
+		}
 		chunks = append(chunks, makeChunk(chunkText, page, workspaceID, spaceKey, len(chunks), 0))
 	}
 

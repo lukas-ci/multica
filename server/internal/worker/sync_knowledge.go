@@ -14,6 +14,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/knowledge/sources"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivermigrate"
+	"github.com/riverqueue/river/rivertype"
 )
 
 type SyncKnowledgeArgs struct {
@@ -159,6 +161,16 @@ type Manager struct {
 func NewManager(pool *pgxpool.Pool, km *knowledge.Manager) (*Manager, error) {
 	m := &Manager{pool: pool}
 
+	// Run River's database migrations to create river_job, river_queue, etc.
+	migrator, err := rivermigrate.New[pgx.Tx](riverpgxv5.New(pool), nil)
+	if err != nil {
+		return nil, fmt.Errorf("river migrator: %w", err)
+	}
+	ctx := context.Background()
+	if _, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
+		return nil, fmt.Errorf("river migrate: %w", err)
+	}
+
 	enqueueFn := func(ctx context.Context, args SyncKnowledgeArgs) error {
 		_, err := m.client.Insert(ctx, args, nil)
 		return err
@@ -187,7 +199,16 @@ func (m *Manager) Stop(ctx context.Context) error  { return m.client.Stop(ctx) }
 
 func (m *Manager) Enqueue(ctx context.Context, args SyncKnowledgeArgs) error {
 	_, err := m.client.Insert(ctx, args, &river.InsertOpts{
-		UniqueOpts: river.UniqueOpts{ByArgs: true},
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+			ByState: []rivertype.JobState{
+				rivertype.JobStateAvailable,
+				rivertype.JobStatePending,
+				rivertype.JobStateRunning,
+				rivertype.JobStateScheduled,
+				rivertype.JobStateRetryable,
+			},
+		},
 	})
 	return err
 }

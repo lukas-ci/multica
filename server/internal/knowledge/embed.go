@@ -35,9 +35,27 @@ type openAIEmbedResponse struct {
 }
 
 func (e *AIGWEmbedder) Embed(texts []string) ([][]float32, error) {
-	reqBody := openAIEmbedRequest{Model: e.Model, Input: texts}
-	body, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequest("POST", e.BaseURL+"/v1/embeddings", bytes.NewReader(body))
+	// Truncate each text to stay under the 8192 token limit
+	// (~32000 chars for English, ~16000 for code-heavy content)
+	const maxEmbedChars = 16000
+	truncated := make([]string, len(texts))
+	for i, t := range texts {
+		if len(t) > maxEmbedChars {
+			truncated[i] = t[:maxEmbedChars]
+		} else {
+			truncated[i] = t
+		}
+	}
+
+	reqBody := openAIEmbedRequest{Model: e.Model, Input: truncated}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("embed marshal: %w", err)
+	}
+	req, err := http.NewRequest("POST", e.BaseURL+"/v1/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("embed request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if e.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+e.APIKey)
@@ -47,9 +65,20 @@ func (e *AIGWEmbedder) Embed(texts []string) ([][]float32, error) {
 		return nil, fmt.Errorf("embed request: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("embed read: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("embed: HTTP %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 200)]))
+	}
 	var embedResp openAIEmbedResponse
-	json.Unmarshal(respBody, &embedResp)
+	if err := json.Unmarshal(respBody, &embedResp); err != nil {
+		return nil, fmt.Errorf("embed json: %w", err)
+	}
+	if len(embedResp.Data) != len(texts) {
+		return nil, fmt.Errorf("embed: expected %d embeddings, got %d", len(texts), len(embedResp.Data))
+	}
 	result := make([][]float32, len(embedResp.Data))
 	for i, d := range embedResp.Data {
 		vec := make([]float32, len(d.Embedding))
@@ -79,15 +108,29 @@ type ollamaEmbedResponse struct {
 
 func (e *OllamaEmbedder) Embed(texts []string) ([][]float32, error) {
 	reqBody := ollamaEmbedRequest{Model: e.Model, Input: texts}
-	body, _ := json.Marshal(reqBody)
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("ollama embed marshal: %w", err)
+	}
 	resp, err := embedHTTPClient.Post(e.BaseURL+"/api/embed", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("ollama embed: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("ollama embed read: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("ollama embed: HTTP %d: %s", resp.StatusCode, string(respBody[:min(len(respBody), 200)]))
+	}
 	var embedResp ollamaEmbedResponse
-	json.Unmarshal(respBody, &embedResp)
+	if err := json.Unmarshal(respBody, &embedResp); err != nil {
+		return nil, fmt.Errorf("ollama embed json: %w", err)
+	}
+	if len(embedResp.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("ollama embed: expected %d embeddings, got %d", len(texts), len(embedResp.Embeddings))
+	}
 	result := make([][]float32, len(embedResp.Embeddings))
 	for i, emb := range embedResp.Embeddings {
 		vec := make([]float32, len(emb))
