@@ -22,6 +22,80 @@ func TestNewReturnsOpencodeBackend(t *testing.T) {
 	}
 }
 
+func TestNormalizeOpenCodePWD(t *testing.T) {
+	t.Parallel()
+
+	env := normalizeOpenCodePWD([]string{
+		"PATH=/usr/bin",
+		"PWD=/old/daemon/dir",
+		"FOO=bar",
+		"PWD=/duplicate",
+	}, "/task/workdir")
+
+	want := []string{
+		"PATH=/usr/bin",
+		"PWD=/task/workdir",
+		"FOO=bar",
+	}
+	if strings.Join(env, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("normalized env:\n got %q\nwant %q", env, want)
+	}
+}
+
+func TestNormalizeOpenCodePWDAppendsWhenMissing(t *testing.T) {
+	t.Parallel()
+
+	env := normalizeOpenCodePWD([]string{"PATH=/usr/bin"}, "/task/workdir")
+	if got := env[len(env)-1]; got != "PWD=/task/workdir" {
+		t.Fatalf("last env entry = %q, want PWD=/task/workdir; env=%v", got, env)
+	}
+}
+
+func TestNormalizeOpenCodePWDNoCwd(t *testing.T) {
+	t.Parallel()
+
+	env := []string{"PATH=/usr/bin", "PWD=/old"}
+	got := normalizeOpenCodePWD(env, "")
+	if &got[0] != &env[0] {
+		t.Fatalf("expected no allocation when cwd is empty")
+	}
+}
+
+func TestExtractMcpServersConvertsToOpenCodeSchema(t *testing.T) {
+	t.Parallel()
+
+	servers := extractMcpServers(json.RawMessage(`{
+		"mcpServers": {
+			"knowledge": {
+				"command": "node",
+				"args": ["/tmp/mcp-knowledge/index.mjs"],
+				"env": {
+					"MULTICA_API_URL": "http://127.0.0.1:8088",
+					"MULTICA_WORKSPACE_ID": "workspace-id"
+				}
+			}
+		}
+	}`))
+
+	entry, ok := servers["knowledge"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("knowledge server missing or wrong type: %#v", servers["knowledge"])
+	}
+	if entry["type"] != "local" {
+		t.Fatalf("type = %#v, want local", entry["type"])
+	}
+	if _, ok := entry["environment"]; !ok {
+		t.Fatalf("expected OpenCode environment key, got %#v", entry)
+	}
+	if _, ok := entry["env"]; ok {
+		t.Fatalf("did not expect Claude-style env key in OpenCode config: %#v", entry)
+	}
+	command, ok := entry["command"].([]string)
+	if !ok || strings.Join(command, " ") != "node /tmp/mcp-knowledge/index.mjs" {
+		t.Fatalf("command = %#v", entry["command"])
+	}
+}
+
 // ── Text event tests ──
 
 func TestOpencodeHandleTextEvent(t *testing.T) {
@@ -548,6 +622,42 @@ func TestOpencodeProcessEventsHappyPath(t *testing.T) {
 	}
 	if msgs[4].Type != MessageText || msgs[4].Content != " Done." {
 		t.Errorf("msg[4]: got %+v", msgs[4])
+	}
+}
+
+func TestOpencodeProcessEventsUsesToolOutputWhenTextEmpty(t *testing.T) {
+	t.Parallel()
+
+	b := &opencodeBackend{cfg: Config{Logger: slog.Default()}}
+	ch := make(chan Message, 256)
+
+	lines := strings.Join([]string{
+		`{"type":"step_start","timestamp":1000,"sessionID":"ses_tool_only","part":{"type":"step-start"}}`,
+		`{"type":"tool_use","timestamp":1001,"sessionID":"ses_tool_only","part":{"tool":"bash","callID":"call_1","state":{"status":"completed","input":{"command":"multica issue list --output json"},"output":"{\"issues\":[{\"identifier\":\"LAN-1\",\"priority\":\"none\"}]}"}}}`,
+		`{"type":"step_finish","timestamp":1002,"sessionID":"ses_tool_only","part":{"type":"step-finish"}}`,
+	}, "\n")
+
+	result := b.processEvents(strings.NewReader(lines), ch)
+
+	if result.status != "completed" {
+		t.Fatalf("status: got %q, want completed", result.status)
+	}
+	if !strings.Contains(result.output, `"identifier":"LAN-1"`) {
+		t.Fatalf("expected tool output fallback, got %q", result.output)
+	}
+
+	close(ch)
+	var textMsgs []Message
+	for msg := range ch {
+		if msg.Type == MessageText {
+			textMsgs = append(textMsgs, msg)
+		}
+	}
+	if len(textMsgs) != 1 {
+		t.Fatalf("expected fallback to emit one text message, got %d", len(textMsgs))
+	}
+	if textMsgs[0].Content != result.output {
+		t.Fatalf("fallback text = %q, want result output %q", textMsgs[0].Content, result.output)
 	}
 }
 

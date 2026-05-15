@@ -18,8 +18,8 @@ func mergeKnowledgeMCP(existing json.RawMessage, baseURL, workspaceID string) js
 	// Read PAT from the daemon's Multica config for API auth
 	pat := readMulticaToken()
 	envVars := map[string]string{
-		"MULTICA_API_URL":        strings.TrimSuffix(baseURL, "/api/mcp"),
-		"MULTICA_WORKSPACE_SLUG": workspaceID,
+		"MULTICA_API_URL":      strings.TrimSuffix(baseURL, "/api/mcp"),
+		"MULTICA_WORKSPACE_ID": workspaceID,
 	}
 	if pat != "" {
 		envVars["MULTICA_AUTH_TOKEN"] = pat

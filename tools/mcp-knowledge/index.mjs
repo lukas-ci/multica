@@ -7,6 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 const BASE = process.env.MULTICA_API_URL || "http://192.168.3.172:8088";
+const WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || "";
 const WORKSPACE_SLUG = process.env.MULTICA_WORKSPACE_SLUG || "";
 const TOKEN = process.env.MULTICA_AUTH_TOKEN || "";
 
@@ -40,7 +41,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   const headers = { "Content-Type": "application/json" };
-  if (WORKSPACE_SLUG) headers["X-Workspace-Slug"] = WORKSPACE_SLUG;
+  if (WORKSPACE_ID) headers["X-Workspace-ID"] = WORKSPACE_ID;
+  else if (WORKSPACE_SLUG) headers["X-Workspace-Slug"] = WORKSPACE_SLUG;
   if (TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
 
   const resp = await fetch(`${BASE}/api/mcp`, {

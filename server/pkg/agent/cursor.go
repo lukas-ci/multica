@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -38,6 +40,10 @@ func (b *cursorBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 
 	args := buildCursorArgs(prompt, opts, b.cfg.Logger)
 	argv0, cmdArgs := chooseCursorInvocation(execName, lookedUp, args, b.cfg.Logger)
+	if err := writeCursorMcpConfig(opts.Cwd, opts.McpConfig); err != nil {
+		cancel()
+		return nil, err
+	}
 
 	cmd := exec.CommandContext(runCtx, argv0, cmdArgs...)
 	hideAgentWindow(cmd)
@@ -392,6 +398,7 @@ var cursorBlockedArgs = map[string]blockedArgMode{
 	"-p":              blockedStandalone, // non-interactive print mode
 	"--output-format": blockedWithValue,  // stream-json protocol
 	"--yolo":          blockedStandalone, // auto-approval for autonomous operation
+	"--approve-mcps":  blockedStandalone, // controlled by daemon when MCP config is injected
 }
 
 // buildCursorArgs assembles the argv for a one-shot cursor-agent invocation.
@@ -406,6 +413,9 @@ func buildCursorArgs(prompt string, opts ExecOptions, logger *slog.Logger) []str
 		"--output-format", "stream-json",
 		"--yolo",
 	}
+	if len(opts.McpConfig) > 0 {
+		args = append(args, "--approve-mcps")
+	}
 	if opts.Cwd != "" {
 		args = append(args, "--workspace", opts.Cwd)
 	}
@@ -419,4 +429,19 @@ func buildCursorArgs(prompt string, opts ExecOptions, logger *slog.Logger) []str
 	}
 	args = append(args, filterCustomArgs(opts.CustomArgs, cursorBlockedArgs, logger)...)
 	return args
+}
+
+func writeCursorMcpConfig(cwd string, mcpConfig json.RawMessage) error {
+	if cwd == "" || len(mcpConfig) == 0 {
+		return nil
+	}
+	dir := filepath.Join(cwd, ".cursor")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create cursor mcp config dir: %w", err)
+	}
+	path := filepath.Join(dir, "mcp.json")
+	if err := os.WriteFile(path, mcpConfig, 0o600); err != nil {
+		return fmt.Errorf("write cursor mcp config: %w", err)
+	}
+	return nil
 }

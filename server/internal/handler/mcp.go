@@ -95,6 +95,10 @@ func (h *Handler) mcpCallTool(w http.ResponseWriter, r *http.Request, req mcpReq
 		writeJSON(w, http.StatusOK, mcpResponse{Error: &mcpError{Code: -32602, Message: "query is required"}})
 		return
 	}
+	if status := h.reconcileReadyKnowledgeIndex(r.Context(), workspaceID); status.Unhealthy {
+		writeJSON(w, http.StatusOK, mcpResponse{Error: &mcpError{Code: -32603, Message: status.ErrorMessage}})
+		return
+	}
 
 	results, err := h.KnowledgeManager.Search(r.Context(), knowledge.SearchRequest{
 		WorkspaceID: workspaceID,

@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,8 +24,9 @@ func TestBuildCursorArgs(t *testing.T) {
 	t.Parallel()
 
 	args := buildCursorArgs("do something", ExecOptions{
-		Cwd:   "/tmp/work",
-		Model: "composer-1.5",
+		Cwd:       "/tmp/work",
+		Model:     "composer-1.5",
+		McpConfig: json.RawMessage(`{"mcpServers":{"knowledge":{"command":"node"}}}`),
 	}, slog.Default())
 
 	expected := []string{
@@ -31,6 +34,7 @@ func TestBuildCursorArgs(t *testing.T) {
 		"-p", "do something",
 		"--output-format", "stream-json",
 		"--yolo",
+		"--approve-mcps",
 		"--workspace", "/tmp/work",
 		"--model", "composer-1.5",
 	}
@@ -71,6 +75,25 @@ func TestBuildCursorArgsMinimal(t *testing.T) {
 
 	if len(args) != len(expected) {
 		t.Fatalf("expected %d args, got %d: %v", len(expected), len(args), args)
+	}
+}
+
+func TestWriteCursorMcpConfigWritesWorkspaceConfig(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	raw := json.RawMessage(`{"mcpServers":{"knowledge":{"command":"node","args":["/tmp/mcp-knowledge/index.mjs"]}}}`)
+
+	if err := writeCursorMcpConfig(dir, raw); err != nil {
+		t.Fatalf("writeCursorMcpConfig: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, ".cursor", "mcp.json"))
+	if err != nil {
+		t.Fatalf("read cursor mcp config: %v", err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("mcp.json = %s, want %s", got, raw)
 	}
 }
 

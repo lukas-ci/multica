@@ -27,6 +27,10 @@ func (m *Manager) DropCollection(ctx context.Context, workspaceID string) error 
 	return m.store.DropCollection(ctx, workspaceID)
 }
 
+func (m *Manager) CountIndexedChunks(ctx context.Context, workspaceID string) (uint64, error) {
+	return m.store.CountPoints(ctx, workspaceID)
+}
+
 func (m *Manager) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {
 	if req.Limit == 0 {
 		req.Limit = 10

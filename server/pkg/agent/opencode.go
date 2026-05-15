@@ -20,6 +20,8 @@ var opencodeBlockedArgs = map[string]blockedArgMode{
 	"--format": blockedWithValue, // json output format for daemon communication
 }
 
+const opencodeToolOutputFallbackBytes = 64 * 1024
+
 // opencodeBackend implements Backend by spawning `opencode run --format json`
 // and reading streaming JSON events from stdout — the same pattern as Claude.
 type opencodeBackend struct {
@@ -91,6 +93,7 @@ func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecO
 	} else {
 		b.cfg.Logger.Debug("opencode: McpConfig is empty, skipping OPENCODE_CONFIG_CONTENT")
 	}
+	env = normalizeOpenCodePWD(env, opts.Cwd)
 	cmd.Env = env
 
 	// Blocking exec path: use CombinedOutput instead of StdoutPipe.
@@ -199,6 +202,7 @@ type eventResult struct {
 // the accumulated result. This is the core scanner loop, extracted for testability.
 func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventResult {
 	var output strings.Builder
+	var toolOutputFallback strings.Builder
 	var sessionID string
 	var usage TokenUsage
 	finalStatus := "completed"
@@ -222,9 +226,15 @@ func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventRes
 			b.cfg.Logger.Debug("opencode: skip non-JSON line", "preview", preview)
 			continue
 		}
+		if event.SessionID != "" {
+			sessionID = event.SessionID
+		}
 		switch event.Type {
+		case "text":
+			b.handleTextEvent(event, ch, &output)
 		case "tool_use":
 			b.cfg.Logger.Debug("opencode: received tool_use event", "tool", event.Part.Tool)
+			b.captureToolOutputFallback(event, &toolOutputFallback)
 			b.handleToolUseEvent(event, ch)
 		case "error":
 			b.handleErrorEvent(event, ch, &finalStatus, &finalError)
@@ -252,10 +262,18 @@ func (b *opencodeBackend) processEvents(r io.Reader, ch chan<- Message) eventRes
 		}
 	}
 
+	finalOutput := output.String()
+	if finalOutput == "" {
+		finalOutput = toolOutputFallback.String()
+		if finalOutput != "" {
+			trySend(ch, Message{Type: MessageText, Content: finalOutput})
+		}
+	}
+
 	return eventResult{
 		status:    finalStatus,
 		errMsg:    finalError,
-		output:    output.String(),
+		output:    finalOutput,
 		sessionID: sessionID,
 		usage:     usage,
 	}
@@ -297,6 +315,25 @@ func (b *opencodeBackend) handleToolUseEvent(event opencodeEvent, ch chan<- Mess
 			Output: outputStr,
 		})
 	}
+}
+
+func (b *opencodeBackend) captureToolOutputFallback(event opencodeEvent, fallback *strings.Builder) {
+	if event.Part.State == nil || event.Part.State.Status != "completed" {
+		return
+	}
+	outputStr := strings.TrimSpace(extractToolOutput(event.Part.State.Output))
+	if outputStr == "" || fallback.Len() >= opencodeToolOutputFallbackBytes {
+		return
+	}
+	if fallback.Len() > 0 {
+		fallback.WriteString("\n\n")
+	}
+	remaining := opencodeToolOutputFallbackBytes - fallback.Len()
+	if len(outputStr) > remaining {
+		fallback.WriteString(outputStr[:remaining])
+		return
+	}
+	fallback.WriteString(outputStr)
 }
 
 // handleErrorEvent processes "error" events from opencode. OpenCode can exit
@@ -463,8 +500,8 @@ type opencodeErrData struct {
 }
 
 // extractMcpServers extracts the MCP servers map from a json.RawMessage
-// containing {"mcpServers": {...}} and converts to opencode format:
-// {"name": {"command": [...], "enabled": true, ...}}.
+// containing {"mcpServers": {...}} and converts to OpenCode format:
+// {"name": {"type": "local", "command": [...], "enabled": true, ...}}.
 func extractMcpServers(raw json.RawMessage) map[string]interface{} {
 	var wrapper map[string]interface{}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
@@ -484,7 +521,7 @@ func extractMcpServers(raw json.RawMessage) map[string]interface{} {
 		if !ok {
 			continue
 		}
-		entry := map[string]interface{}{"enabled": true}
+		entry := map[string]interface{}{"type": "local", "enabled": true}
 		if cmd, ok := srvMap["command"].(string); ok {
 			var args []string
 			if a, ok := srvMap["args"].([]interface{}); ok {
@@ -497,7 +534,7 @@ func extractMcpServers(raw json.RawMessage) map[string]interface{} {
 			entry["command"] = append([]string{cmd}, args...)
 		}
 		if env, ok := srvMap["env"]; ok {
-			entry["env"] = env
+			entry["environment"] = env
 		}
 		result[name] = entry
 	}
@@ -529,6 +566,32 @@ func (b *opencodeBackend) writeOpenCodeMcpConfig(cwd string, mcpConfig json.RawM
 		return
 	}
 	b.cfg.Logger.Debug("opencode: wrote per-task MCP config", "path", configPath)
+}
+
+func normalizeOpenCodePWD(env []string, cwd string) []string {
+	if cwd == "" {
+		return env
+	}
+	// OpenCode trusts PWD over getcwd(). If Go's cmd.Dir changes cwd while PWD
+	// still points at the daemon's launch dir, `opencode run` exits 0 with no
+	// stdout/stderr. Keep the logical and actual cwd in sync for the child.
+	out := make([]string, 0, len(env)+1)
+	found := false
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == "PWD" {
+			if !found {
+				out = append(out, "PWD="+cwd)
+				found = true
+			}
+			continue
+		}
+		out = append(out, entry)
+	}
+	if !found {
+		out = append(out, "PWD="+cwd)
+	}
+	return out
 }
 
 // runBlocking runs opencode via CombinedOutput — no pipes, no goroutines,

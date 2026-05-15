@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -13,6 +14,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/knowledge/sources"
 	"github.com/multica-ai/multica/server/internal/logger"
 )
+
+const knowledgeEmptyIndexError = "knowledge source marked ready but index collection is empty; re-sync required"
+
+type knowledgeIndexHealth struct {
+	Unhealthy    bool
+	ErrorMessage string
+}
 
 type knowledgeSourceResponse struct {
 	ID           string  `json:"id"`
@@ -38,6 +46,7 @@ func (h *Handler) ListKnowledgeSources(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "workspace_id is required")
 		return
 	}
+	h.reconcileReadyKnowledgeIndex(r.Context(), workspaceID)
 
 	rows, err := h.DB.Query(r.Context(), `
 		SELECT id, workspace_id, source_type, display_name, sync_status, sync_error, last_synced_at, created_at, updated_at
@@ -264,6 +273,10 @@ func (h *Handler) SearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "knowledge search is not available (Qdrant not configured)")
 		return
 	}
+	if status := h.reconcileReadyKnowledgeIndex(r.Context(), workspaceID); status.Unhealthy {
+		writeError(w, http.StatusServiceUnavailable, status.ErrorMessage)
+		return
+	}
 
 	results, err := h.KnowledgeManager.Search(r.Context(), req)
 	if err != nil {
@@ -275,4 +288,44 @@ func (h *Handler) SearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		results = []knowledge.SearchResult{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func knowledgeIndexHealthStatus(readySourceCount int, indexedPointCount uint64, countErr error) knowledgeIndexHealth {
+	if countErr != nil || readySourceCount == 0 || indexedPointCount > 0 {
+		return knowledgeIndexHealth{}
+	}
+	return knowledgeIndexHealth{Unhealthy: true, ErrorMessage: knowledgeEmptyIndexError}
+}
+
+func (h *Handler) reconcileReadyKnowledgeIndex(ctx context.Context, workspaceID string) knowledgeIndexHealth {
+	if h.KnowledgeManager == nil || workspaceID == "" {
+		return knowledgeIndexHealth{}
+	}
+	var readyCount int
+	if err := h.DB.QueryRow(ctx, `
+		SELECT count(*) FROM knowledge_sources
+		WHERE workspace_id = $1 AND sync_status = 'ready'
+	`, parseUUID(workspaceID)).Scan(&readyCount); err != nil {
+		slog.Warn("knowledge ready health query failed", "workspace_id", workspaceID, "error", err)
+		return knowledgeIndexHealth{}
+	}
+	count, err := h.KnowledgeManager.CountIndexedChunks(ctx, workspaceID)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("knowledge index count failed", "workspace_id", workspaceID, "error", err)
+		}
+		return knowledgeIndexHealthStatus(readyCount, 0, err)
+	}
+	status := knowledgeIndexHealthStatus(readyCount, count, nil)
+	if !status.Unhealthy {
+		return status
+	}
+	if _, err := h.DB.Exec(ctx, `
+		UPDATE knowledge_sources
+		SET sync_status = 'error', sync_error = $2
+		WHERE workspace_id = $1 AND sync_status = 'ready'
+	`, parseUUID(workspaceID), status.ErrorMessage); err != nil {
+		slog.Warn("knowledge ready health update failed", "workspace_id", workspaceID, "error", err)
+	}
+	return status
 }

@@ -93,6 +93,24 @@ func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []C
 	return err
 }
 
+func (s *QdrantStore) CountPoints(ctx context.Context, workspaceID string) (uint64, error) {
+	if err := s.ensureCollection(ctx, workspaceID); err != nil {
+		return 0, err
+	}
+	exact := true
+	resp, err := s.client.Count(ctx, &qdrantpb.CountPoints{
+		CollectionName: collectionName(workspaceID),
+		Exact:          &exact,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if resp.GetResult() == nil {
+		return 0, nil
+	}
+	return resp.GetResult().Count, nil
+}
+
 func generateChunkID(c Chunk) string {
 	return c.WorkspaceID + "-" + c.SourceID + "-" + strconv.Itoa(c.ChunkIndex)
 }

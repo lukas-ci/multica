@@ -144,7 +144,8 @@ func buildCommentPrompt(task Task, provider string) string {
 func buildChatPrompt(task Task) string {
 	var b strings.Builder
 	b.WriteString("You are a coding agent. Use tools to find information and complete tasks.\n")
-	b.WriteString("This workspace has linked knowledge sources. Search them before answering.\n\n")
+	b.WriteString("This workspace has linked knowledge sources. Use the workspace knowledge_search tool for questions about linked docs or external knowledge; do not substitute unrelated local corpora.\n")
+	b.WriteString("After any tool calls, always finish with a concise natural-language answer to the user. Do not stop with tool output only.\n\n")
 	fmt.Fprintf(&b, "User message:\n%s\n", task.ChatMessage)
 	// List attachments by id + filename so the agent can fetch them via
 	// the CLI. We deliberately do NOT inline the URL: chat attachments
