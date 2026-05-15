@@ -350,6 +350,18 @@ func main() {
 	go runDBStatsLogger(sweepCtx, pool)
 
 	if workerMgr != nil {
+		workerMgr.RegisterPeriodicJobs()
+
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE knowledge_sources
+			SET sync_status = 'error', sync_error = 'server restarted mid-sync, re-sync required'
+			WHERE sync_status = 'syncing'
+		`); err != nil {
+			slog.Warn("startup: failed to recover stuck knowledge sources", "error", err)
+		} else {
+			slog.Info("startup: recovered stuck knowledge sources")
+		}
+
 		go func() {
 			slog.Info("worker manager starting")
 			if err := workerMgr.Start(workerCtx); err != nil {
