@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,7 +21,9 @@ type ConfluenceConfig struct {
 	SpaceKey string `json:"space_key"`
 }
 
-type ConfluenceConnector struct{}
+type ConfluenceConnector struct {
+	httpClient *http.Client
+}
 
 func (c *ConfluenceConnector) SourceType() knowledge.SourceType {
 	return knowledge.SourceConfluence
@@ -52,42 +53,23 @@ type confluenceSearchResult struct {
 	} `json:"_links"`
 }
 
-func (c *ConfluenceConnector) Fetch(ctx context.Context, workspaceID, configJSON string) ([]knowledge.Chunk, error) {
-	var cfg ConfluenceConfig
-	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
-	}
-
-	var allChunks []knowledge.Chunk
-	cursor := ""
-
-	for {
-		result, err := c.FetchPage(ctx, workspaceID, configJSON, cursor, nil)
-		if err != nil {
-			return nil, err
-		}
-		allChunks = append(allChunks, result.Chunks...)
-		if result.NextCursor == "" {
-			break
-		}
-		cursor = result.NextCursor
-	}
-
-	slog.Info("Confluence fetch complete", "space", cfg.SpaceKey, "chunks", len(allChunks))
-	return allChunks, nil
-}
-
 func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, configJSON, cursor string, since *time.Time) (*PageResult, error) {
 	var cfg ConfluenceConfig
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	baseURL := strings.TrimRight(cfg.BaseURL, "/")
-	email := cfg.Email
-	if email == "" {
-		email = "lukas.hu@instacart.com"
+	if cfg.Email == "" {
+		return nil, fmt.Errorf("confluence config: email is required")
 	}
+	if cfg.BaseURL == "" {
+		return nil, fmt.Errorf("confluence config: base_url is required")
+	}
+	if cfg.SpaceKey == "" {
+		return nil, fmt.Errorf("confluence config: space_key is required")
+	}
+
+	baseURL := strings.TrimRight(cfg.BaseURL, "/")
 
 	reqURL := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&expand=body.storage,version&limit=25", baseURL, cfg.SpaceKey)
 	if cursor != "" {
@@ -97,19 +79,45 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 		}
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	req.SetBasicAuth(email, cfg.Token)
-	resp, err := http.DefaultClient.Do(req)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("confluence create request: %w", err)
+	}
+	req.SetBasicAuth(cfg.Email, cfg.Token)
+
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Minute}
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("confluence fetch: %w", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(resp.Body)
+		truncated := snippet
+		if len(truncated) > 512 {
+			truncated = truncated[:512]
+		}
+		return nil, fmt.Errorf("confluence API returned %d: %s", resp.StatusCode, string(truncated))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("confluence read body: %w", err)
+	}
 
 	var result confluenceSearchResult
-	json.Unmarshal(body, &result)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("confluence decode response: %w", err)
+	}
 
 	var chunks []knowledge.Chunk
+	pageCount := 0
+
 	for _, page := range result.Results {
 		var lastModified time.Time
 		if !page.Version.When.IsZero() {
@@ -119,6 +127,8 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 		if since != nil && !since.IsZero() && !lastModified.IsZero() && !lastModified.After(*since) {
 			continue
 		}
+
+		pageCount++
 
 		pageChunks := chunkPage(page, workspaceID, cfg.SpaceKey)
 		chunks = append(chunks, pageChunks...)
@@ -138,7 +148,7 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 	return &PageResult{
 		Chunks:     chunks,
 		NextCursor: nextCursor,
-		TotalCount: result.Size,
+		PageCount:  pageCount,
 	}, nil
 }
 
@@ -220,6 +230,7 @@ func makeChunk(text string, page confluencePage, workspaceID, spaceKey string, i
 		Text:        text,
 		SourceType:  knowledge.SourceConfluence,
 		SourceID:    spaceKey,
+		PageID:      page.ID,
 		WorkspaceID: workspaceID,
 		URL:         page.Links.WebUI,
 		Title:       page.Title,

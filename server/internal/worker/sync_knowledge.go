@@ -87,9 +87,9 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 			return err
 		}
 
-		newPagesFetched := result.TotalCount
+		newPagesFetched := result.PageCount
 		if result.NextCursor == "" {
-			newPagesFetched = result.TotalCount
+			newPagesFetched = result.PageCount
 		} else {
 			var currentFetched int
 			w.pool.QueryRow(ctx, `SELECT pages_fetched FROM knowledge_sources WHERE id = $1`, srcUUID).Scan(&currentFetched)
@@ -100,7 +100,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 			UPDATE knowledge_sources
 			SET checkpoint = $1, pages_fetched = $2, total_pages = $3
 			WHERE id = $4
-		`, result.NextCursor, newPagesFetched, result.TotalCount, srcUUID)
+		`, result.NextCursor, newPagesFetched, result.PageCount, srcUUID)
 	}
 
 	if result.NextCursor != "" && w.enqueue != nil {
