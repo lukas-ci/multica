@@ -194,29 +194,40 @@ func (m *Manager) EnqueueScheduled(ctx context.Context, args SyncKnowledgeArgs, 
 	return err
 }
 
-func (m *Manager) RegisterPeriodicJobs(ctx context.Context, pool *pgxpool.Pool) error {
-	const queryReadySources = `SELECT id, workspace_id FROM knowledge_sources WHERE sync_status = 'ready' ORDER BY last_synced_at ASC NULLS FIRST LIMIT 1`
-
-	// In River v0.37, PeriodicJobConstructor receives no context, so
-	// we use context.Background() for the DB query inside the constructor.
+func (m *Manager) RegisterPeriodicJobs() error {
 	m.client.PeriodicJobs().Add(river.NewPeriodicJob(
 		river.PeriodicInterval(24*time.Hour),
 		func() (river.JobArgs, *river.InsertOpts) {
-			rows, err := pool.Query(context.Background(), queryReadySources)
+			rows, err := m.pool.Query(context.Background(), `
+				SELECT id, workspace_id FROM knowledge_sources WHERE sync_status = 'ready'
+			`)
 			if err != nil {
-				slog.Warn("sync-knowledge: periodic query failed", "error", err, "sql", queryReadySources)
+				slog.Warn("sync-knowledge: periodic query failed", "error", err)
 				return nil, nil
 			}
 			defer rows.Close()
 
-			if rows.Next() {
+			var firstID, firstWS string
+			for rows.Next() {
 				var id, wsID string
 				if err := rows.Scan(&id, &wsID); err != nil {
-					return nil, nil
+					continue
 				}
-				return SyncKnowledgeArgs{
+				if firstID == "" {
+					firstID, firstWS = id, wsID
+					continue
+				}
+				// Enqueue all but the first directly (constructor returns the first)
+				m.client.Insert(context.Background(), SyncKnowledgeArgs{
 					SourceID:    id,
 					WorkspaceID: wsID,
+					SyncKind:    string(knowledge.SyncIncremental),
+				}, nil)
+			}
+			if firstID != "" {
+				return SyncKnowledgeArgs{
+					SourceID:    firstID,
+					WorkspaceID: firstWS,
 					SyncKind:    string(knowledge.SyncIncremental),
 				}, nil
 			}
