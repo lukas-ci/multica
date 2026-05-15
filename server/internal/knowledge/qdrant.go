@@ -119,10 +119,6 @@ func stablePointID(sourceID, pageID string, chunkIndex int) uint64 {
 	return crc64.Checksum([]byte(key), pointIDTable)
 }
 
-func generateChunkID(c Chunk) string {
-	return c.WorkspaceID + "-" + c.SourceID + "-" + strconv.Itoa(c.ChunkIndex)
-}
-
 func (s *QdrantStore) Search(ctx context.Context, workspaceID string, queryVector []float32, limit int, sourceTypes []SourceType) ([]SearchResult, error) {
 	if err := s.ensureCollection(ctx, workspaceID); err != nil {
 		return nil, err
