@@ -27,6 +27,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
 	"github.com/multica-ai/multica/server/internal/util"
+	"github.com/multica-ai/multica/server/internal/worker"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -78,7 +79,9 @@ type RouterOptions struct {
 	// passthrough scheduler on the constructed Handler. main.go injects a
 	// BatchedHeartbeatScheduler here so the caller can also drive Run/Stop;
 	// tests leave this nil and get the legacy synchronous behavior.
+	KnowledgeManager *knowledge.Manager
 	HeartbeatScheduler handler.HeartbeatScheduler
+	WorkerManager    *worker.Manager
 }
 
 func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analyticsClient analytics.Client, rdb *redis.Client, opts RouterOptions) chi.Router {
@@ -109,13 +112,18 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		AllowedEmailDomains:           splitAndTrim(os.Getenv("ALLOWED_EMAIL_DOMAINS")),
 		UseDailyRollupForRuntimeUsage: os.Getenv("USAGE_DAILY_ROLLUP_ENABLED") == "true",
 	}
-	knowledgeManager, err := knowledge.NewManager()
-	if err != nil {
-		slog.Warn("Knowledge manager unavailable (Qdrant not running?)", "error", err)
-		knowledgeManager = nil
+	knowledgeManager := opts.KnowledgeManager
+	if knowledgeManager == nil {
+		km, err := knowledge.NewManager()
+		if err != nil {
+			slog.Warn("Knowledge manager unavailable (Qdrant not running?)", "error", err)
+		} else {
+			knowledgeManager = km
+		}
 	}
 
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, knowledgeManager, daemonHub)
+	h.WorkerManager = opts.WorkerManager
 	if opts.DaemonWakeup != nil {
 		h.TaskService.Wakeup = opts.DaemonWakeup
 	}

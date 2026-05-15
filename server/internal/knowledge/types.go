@@ -13,6 +13,7 @@ type Chunk struct {
 	Text        string            `json:"text"`
 	SourceType  SourceType        `json:"source_type"`
 	SourceID    string            `json:"source_id"`
+	PageID      string            `json:"page_id"`
 	WorkspaceID string            `json:"workspace_id"`
 	URL         string            `json:"url"`
 	Title       string            `json:"title"`
@@ -32,8 +33,15 @@ type SearchResult struct {
 }
 
 type SearchRequest struct {
-	WorkspaceID string      `json:"workspace_id"`
-	Query       string      `json:"query"`
+	WorkspaceID string       `json:"workspace_id"`
+	Query       string       `json:"query"`
 	SourceTypes []SourceType `json:"source_types,omitempty"`
 	Limit       int          `json:"limit,omitempty"`
 }
+
+type SyncKind string
+
+const (
+	SyncFull        SyncKind = "full"
+	SyncIncremental SyncKind = "incremental"
+)

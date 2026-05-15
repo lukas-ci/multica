@@ -15,10 +15,12 @@ import (
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
+	"github.com/multica-ai/multica/server/internal/knowledge"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/worker"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/redis/go-redis/v9"
 )
@@ -293,11 +295,28 @@ func main() {
 	// shutdown so any pending bumps are flushed before we exit.
 	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
 
+	knowledgeManager, err := knowledge.NewManager()
+	if err != nil {
+		slog.Warn("Knowledge manager unavailable (Qdrant not running?)", "error", err)
+		knowledgeManager = nil
+	}
+
+	var workerMgr *worker.Manager
+	if knowledgeManager != nil {
+		workerMgr, err = worker.NewManager(pool, knowledgeManager)
+		if err != nil {
+			slog.Error("unable to create worker manager (River)", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	r := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
 		HTTPMetrics:        httpMetrics,
 		DaemonHub:          daemonHub,
 		DaemonWakeup:       daemonWakeup,
 		HeartbeatScheduler: heartbeatScheduler,
+		KnowledgeManager:   knowledgeManager,
+		WorkerManager:      workerMgr,
 	})
 
 	srv := &http.Server{
@@ -308,6 +327,7 @@ func main() {
 	// Start background workers.
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	autopilotCtx, autopilotCancel := context.WithCancel(context.Background())
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	taskSvc := service.NewTaskService(queries, pool, hub, bus, daemonWakeup)
 	taskSvc.Analytics = analyticsClient
 	autopilotSvc := service.NewAutopilotService(queries, pool, bus, taskSvc)
@@ -328,6 +348,15 @@ func main() {
 	go runAutopilotScheduler(autopilotCtx, queries, autopilotSvc)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	go runDBStatsLogger(sweepCtx, pool)
+
+	if workerMgr != nil {
+		go func() {
+			slog.Info("worker manager starting")
+			if err := workerMgr.Start(workerCtx); err != nil {
+				slog.Error("worker manager stopped with error", "error", err)
+			}
+		}()
+	}
 
 	if metricsServer != nil {
 		go func() {
@@ -352,6 +381,7 @@ func main() {
 
 	slog.Info("shutting down server")
 	autopilotCancel()
+	workerCancel()
 
 	// Order matters: drain in-flight HTTP first so any heartbeat handlers
 	// finish calling Schedule() before we stop the scheduler. Otherwise a
@@ -369,6 +399,15 @@ func main() {
 	// final batch of queued heartbeat bumps.
 	sweepCancel()
 	heartbeatScheduler.Stop()
+
+	if workerMgr != nil {
+		slog.Info("stopping worker manager")
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := workerMgr.Stop(stopCtx); err != nil {
+			slog.Error("worker manager stop failed", "error", err)
+		}
+		stopCancel()
+	}
 
 	if metricsServer != nil {
 		metricsShutdownCtx, metricsShutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)

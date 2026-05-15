@@ -6,13 +6,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/knowledge"
-	"github.com/multica-ai/multica/server/internal/knowledge/sources"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/worker"
 )
 
 const knowledgeEmptyIndexError = "knowledge source marked ready but index collection is empty; re-sync required"
@@ -23,15 +22,20 @@ type knowledgeIndexHealth struct {
 }
 
 type knowledgeSourceResponse struct {
-	ID           string  `json:"id"`
-	WorkspaceID  string  `json:"workspace_id"`
-	SourceType   string  `json:"source_type"`
-	DisplayName  string  `json:"display_name"`
-	SyncStatus   string  `json:"sync_status"`
-	SyncError    *string `json:"sync_error"`
-	LastSyncedAt *string `json:"last_synced_at"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
+	ID              string  `json:"id"`
+	WorkspaceID     string  `json:"workspace_id"`
+	SourceType      string  `json:"source_type"`
+	DisplayName     string  `json:"display_name"`
+	SyncStatus      string  `json:"sync_status"`
+	SyncError       *string `json:"sync_error"`
+	LastSyncedAt    *string `json:"last_synced_at"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
+	PagesFetched    int     `json:"pages_fetched"`
+	TotalPages      *int    `json:"total_pages"`
+	ResourcesFetched int    `json:"resources_fetched"`
+	SyncKind        string  `json:"sync_kind"`
+	Checkpoint      string  `json:"checkpoint"`
 }
 
 type createKnowledgeSourceRequest struct {
@@ -49,7 +53,8 @@ func (h *Handler) ListKnowledgeSources(w http.ResponseWriter, r *http.Request) {
 	h.reconcileReadyKnowledgeIndex(r.Context(), workspaceID)
 
 	rows, err := h.DB.Query(r.Context(), `
-		SELECT id, workspace_id, source_type, display_name, sync_status, sync_error, last_synced_at, created_at, updated_at
+		SELECT id, workspace_id, source_type, display_name, sync_status, sync_error, last_synced_at,
+		       created_at, updated_at, pages_fetched, total_pages, resources_fetched, sync_kind, checkpoint
 		FROM knowledge_sources
 		WHERE workspace_id = $1
 		ORDER BY created_at DESC
@@ -67,7 +72,9 @@ func (h *Handler) ListKnowledgeSources(w http.ResponseWriter, r *http.Request) {
 		var id, wsID pgtype.UUID
 		var lastSyncedAt, createdAt, updatedAt pgtype.Timestamptz
 		var syncError pgtype.Text
-		if err := rows.Scan(&id, &wsID, &s.SourceType, &s.DisplayName, &s.SyncStatus, &syncError, &lastSyncedAt, &createdAt, &updatedAt); err != nil {
+		var totalPages pgtype.Int4
+		if err := rows.Scan(&id, &wsID, &s.SourceType, &s.DisplayName, &s.SyncStatus, &syncError, &lastSyncedAt,
+			&createdAt, &updatedAt, &s.PagesFetched, &totalPages, &s.ResourcesFetched, &s.SyncKind, &s.Checkpoint); err != nil {
 			slog.Warn("ListKnowledgeSources scan failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeError(w, http.StatusInternalServerError, "failed to read knowledge sources")
 			return
@@ -78,6 +85,10 @@ func (h *Handler) ListKnowledgeSources(w http.ResponseWriter, r *http.Request) {
 		s.LastSyncedAt = timestampToPtr(lastSyncedAt)
 		s.CreatedAt = timestampToString(createdAt)
 		s.UpdatedAt = timestampToString(updatedAt)
+		if totalPages.Valid {
+			v := int(totalPages.Int32)
+			s.TotalPages = &v
+		}
 		sources = append(sources, s)
 	}
 
@@ -124,14 +135,16 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	}
 
 	sourceID := uuidToString(id)
-	sourceIDStr := sourceID
 
-	// Auto-trigger sync in background (use background context — request context is cancelled after response)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		h.syncKnowledgeSource(ctx, parseUUID(workspaceID), parseUUID(sourceIDStr), req.SourceType, req.Config)
-	}()
+	if h.WorkerManager != nil {
+		if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
+			SourceID:    sourceID,
+			WorkspaceID: workspaceID,
+			SyncKind:    string(knowledge.SyncFull),
+		}); err != nil {
+			slog.Warn("CreateKnowledgeSource: failed to enqueue sync job", "error", err)
+		}
+	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{"id": sourceID})
 }
@@ -171,42 +184,6 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-func (h *Handler) syncKnowledgeSource(ctx context.Context, wsUUID, srcUUID pgtype.UUID, sourceType string, configJSON json.RawMessage) {
-	if h.KnowledgeManager == nil {
-		slog.Warn("syncKnowledgeSource: KnowledgeManager not available")
-		return
-	}
-
-	h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1`, srcUUID)
-
-	connector := sources.NewConnector(knowledge.SourceType(sourceType))
-	if connector == nil {
-		slog.Warn("syncKnowledgeSource: unknown source type", "source_type", sourceType)
-		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'unknown source type' WHERE id = $1`, srcUUID)
-		return
-	}
-
-	workspaceID := uuidToString(wsUUID)
-	chunks, err := connector.Fetch(ctx, workspaceID, string(configJSON))
-	if err != nil {
-		slog.Warn("syncKnowledgeSource fetch failed", "error", err)
-		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
-		return
-	}
-	if len(chunks) == 0 {
-		slog.Warn("syncKnowledgeSource fetch returned 0 chunks", "source_type", sourceType)
-		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'no content found in source' WHERE id = $1`, srcUUID)
-		return
-	}
-	slog.Info("syncKnowledgeSource chunks fetched", "count", len(chunks))
-	if err := h.KnowledgeManager.IndexChunks(ctx, workspaceID, chunks); err != nil {
-		slog.Warn("syncKnowledgeSource index failed", "error", err)
-		h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = $1 WHERE id = $2`, err.Error(), srcUUID)
-		return
-	}
-	h.DB.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'ready', last_synced_at = now() WHERE id = $1`, srcUUID)
-}
-
 func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 	sourceID := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
@@ -241,12 +218,18 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Run sync in background (use background context — request context is cancelled after response)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		h.syncKnowledgeSource(ctx, wsUUID, srcUUID, sourceType, configJSON)
-	}()
+	if h.WorkerManager != nil {
+		h.DB.Exec(r.Context(), `UPDATE knowledge_sources SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full' WHERE id = $1`, srcUUID)
+		if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
+			SourceID:    sourceID,
+			WorkspaceID: workspaceID,
+			SyncKind:    string(knowledge.SyncFull),
+		}); err != nil {
+			slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to start sync")
+			return
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
 }

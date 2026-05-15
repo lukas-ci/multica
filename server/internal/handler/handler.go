@@ -23,6 +23,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/storage"
 	"github.com/multica-ai/multica/server/internal/util"
+	"github.com/multica-ai/multica/server/internal/worker"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -82,6 +83,7 @@ type Handler struct {
 	PATCache              *auth.PATCache
 	DaemonTokenCache      *auth.DaemonTokenCache
 	KnowledgeManager      *knowledge.Manager
+	WorkerManager         *worker.Manager
 	cfg                   Config
 }
 

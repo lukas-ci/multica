@@ -8,8 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/multica-ai/multica/server/internal/knowledge"
 )
@@ -35,6 +36,9 @@ type confluencePage struct {
 			Value string `json:"value"`
 		} `json:"storage"`
 	} `json:"body"`
+	Version struct {
+		When time.Time `json:"when"`
+	} `json:"version"`
 	Links struct {
 		WebUI string `json:"webui"`
 	} `json:"_links"`
@@ -42,6 +46,7 @@ type confluencePage struct {
 
 type confluenceSearchResult struct {
 	Results []confluencePage `json:"results"`
+	Size    int              `json:"size"`
 	Links   struct {
 		Next string `json:"next"`
 	} `json:"_links"`
@@ -53,65 +58,94 @@ func (c *ConfluenceConnector) Fetch(ctx context.Context, workspaceID, configJSON
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	unstructuredURL := os.Getenv("UNSTRUCTURED_URL")
-	if unstructuredURL == "" {
-		unstructuredURL = "http://unstructured:8000"
-	}
-
 	var allChunks []knowledge.Chunk
-	nextURL := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&expand=body.storage&limit=25", cfg.BaseURL, cfg.SpaceKey)
+	cursor := ""
 
-	for nextURL != "" {
-		req, _ := http.NewRequestWithContext(ctx, "GET", nextURL, nil)
-		email := cfg.Email
-		if email == "" {
-			email = "lukas.hu@instacart.com"
-		}
-		req.SetBasicAuth(email, cfg.Token)
-		resp, err := http.DefaultClient.Do(req)
+	for {
+		result, err := c.FetchPage(ctx, workspaceID, configJSON, cursor, nil)
 		if err != nil {
-			return nil, fmt.Errorf("confluence fetch: %w", err)
+			return nil, err
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		var result confluenceSearchResult
-		json.Unmarshal(body, &result)
-
-		for _, page := range result.Results {
-			chunks, err := chunkWithUnstructured(unstructuredURL, page, workspaceID, cfg.SpaceKey)
-			if err != nil {
-				continue
-			}
-			allChunks = append(allChunks, chunks...)
+		allChunks = append(allChunks, result.Chunks...)
+		if result.NextCursor == "" {
+			break
 		}
-
-		nextURL = result.Links.Next
-		if nextURL != "" && !strings.HasPrefix(nextURL, "http") {
-			nextURL = cfg.BaseURL + "/wiki" + nextURL
-		}
+		cursor = result.NextCursor
 	}
 
 	slog.Info("Confluence fetch complete", "space", cfg.SpaceKey, "chunks", len(allChunks))
 	return allChunks, nil
 }
 
-type unstructuredRequest struct {
-	Filename string `json:"filename"`
-	Content  string `json:"content"`
+func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, configJSON, cursor string, since *time.Time) (*PageResult, error) {
+	var cfg ConfluenceConfig
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	baseURL := strings.TrimRight(cfg.BaseURL, "/")
+	email := cfg.Email
+	if email == "" {
+		email = "lukas.hu@instacart.com"
+	}
+
+	reqURL := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&expand=body.storage,version&limit=25", baseURL, cfg.SpaceKey)
+	if cursor != "" {
+		decoded, err := url.QueryUnescape(cursor)
+		if err == nil {
+			reqURL = decoded
+		}
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	req.SetBasicAuth(email, cfg.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("confluence fetch: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var result confluenceSearchResult
+	json.Unmarshal(body, &result)
+
+	var chunks []knowledge.Chunk
+	for _, page := range result.Results {
+		var lastModified time.Time
+		if !page.Version.When.IsZero() {
+			lastModified = page.Version.When
+		}
+
+		if since != nil && !since.IsZero() && !lastModified.IsZero() && !lastModified.After(*since) {
+			continue
+		}
+
+		pageChunks := chunkPage(page, workspaceID, cfg.SpaceKey)
+		chunks = append(chunks, pageChunks...)
+	}
+
+	var nextCursor string
+	if result.Links.Next != "" {
+		if strings.HasPrefix(result.Links.Next, "/") {
+			nextCursor = url.QueryEscape(baseURL + "/wiki" + result.Links.Next)
+		} else if strings.HasPrefix(result.Links.Next, "http") {
+			nextCursor = url.QueryEscape(result.Links.Next)
+		} else {
+			nextCursor = url.QueryEscape(baseURL + "/wiki/" + result.Links.Next)
+		}
+	}
+
+	return &PageResult{
+		Chunks:     chunks,
+		NextCursor: nextCursor,
+		TotalCount: result.Size,
+	}, nil
 }
 
-type unstructuredElement struct {
-	Text string `json:"text"`
-	Type string `json:"type"`
-}
-
-func chunkWithUnstructured(baseURL string, page confluencePage, workspaceID, spaceKey string) ([]knowledge.Chunk, error) {
-	// Strip HTML tags and chunk by word count directly.
-	// No external Unstructured dependency needed for text extraction.
+func chunkPage(page confluencePage, workspaceID, spaceKey string) []knowledge.Chunk {
 	text := stripHTML(page.Body.Storage.Value)
 	if strings.TrimSpace(text) == "" {
-		return nil, nil
+		return nil
 	}
 
 	words := strings.Fields(text)
@@ -131,11 +165,10 @@ func chunkWithUnstructured(baseURL string, page confluencePage, workspaceID, spa
 		chunks[i].TotalChunks = len(chunks)
 	}
 
-	return chunks, nil
+	return chunks
 }
 
 func stripHTML(html string) string {
-	// Remove HTML tags, scripts, styles
 	b := []byte(html)
 	var out strings.Builder
 	inTag := false
@@ -150,9 +183,6 @@ func stripHTML(html string) string {
 			if len(b) > i+5 && bytes.EqualFold(b[i+1:i+6], []byte("style")) {
 				inStyle = true
 				continue
-			}
-			if len(b) > i+2 && b[i+1] == '/' {
-				// Closing tag — skip
 			}
 			inTag = true
 			continue
@@ -196,18 +226,4 @@ func makeChunk(text string, page confluencePage, workspaceID, spaceKey string, i
 		ChunkIndex:  idx,
 		TotalChunks: total,
 	}
-}
-
-func countWords(s string) int {
-	count := 0
-	inWord := false
-	for _, r := range s {
-		if r == ' ' || r == '\n' || r == '\t' {
-			inWord = false
-		} else if !inWord {
-			count++
-			inWord = true
-		}
-	}
-	return count
 }
