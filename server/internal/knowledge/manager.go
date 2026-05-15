@@ -31,6 +31,10 @@ func (m *Manager) CountIndexedChunks(ctx context.Context, workspaceID string) (u
 	return m.store.CountPoints(ctx, workspaceID)
 }
 
+func (m *Manager) DeleteSourcePoints(ctx context.Context, workspaceID, sourceID string) error {
+	return m.store.DeleteBySourceID(ctx, workspaceID, sourceID)
+}
+
 func (m *Manager) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {
 	if req.Limit == 0 {
 		req.Limit = 10
@@ -58,7 +62,7 @@ func (m *Manager) IndexChunks(ctx context.Context, workspaceID string, chunks []
 		if err != nil {
 			return err
 		}
-		if err := m.store.Upsert(ctx, workspaceID, batch, vectors, i); err != nil {
+		if err := m.store.Upsert(ctx, workspaceID, batch, vectors); err != nil {
 			return err
 		}
 	}

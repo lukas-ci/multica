@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"fmt"
+	"hash/crc64"
 	"strconv"
 	"strings"
 	"time"
@@ -63,7 +64,7 @@ func (s *QdrantStore) ensureCollection(ctx context.Context, workspaceID string) 
 	return err
 }
 
-func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []Chunk, vectors [][]float32, idOffset int) error {
+func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []Chunk, vectors [][]float32) error {
 	if err := s.ensureCollection(ctx, workspaceID); err != nil {
 		return err
 	}
@@ -81,7 +82,7 @@ func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []C
 			"synced_at":    {Kind: &qdrantpb.Value_StringValue{StringValue: time.Now().UTC().Format(time.RFC3339)}},
 		}
 		points[i] = &qdrantpb.PointStruct{
-			Id:      &qdrantpb.PointId{PointIdOptions: &qdrantpb.PointId_Num{Num: uint64(i + idOffset)}},
+			Id:      &qdrantpb.PointId{PointIdOptions: &qdrantpb.PointId_Num{Num: stablePointID(c.SourceID, c.PageID, c.ChunkIndex)}},
 			Vectors: &qdrantpb.Vectors{VectorsOptions: &qdrantpb.Vectors_Vector{Vector: &qdrantpb.Vector{Data: vectors[i]}}},
 			Payload: payload,
 		}
@@ -109,6 +110,13 @@ func (s *QdrantStore) CountPoints(ctx context.Context, workspaceID string) (uint
 		return 0, nil
 	}
 	return resp.GetResult().Count, nil
+}
+
+var pointIDTable = crc64.MakeTable(crc64.ECMA)
+
+func stablePointID(sourceID, pageID string, chunkIndex int) uint64 {
+	key := sourceID + ":" + pageID + ":" + strconv.Itoa(chunkIndex)
+	return crc64.Checksum([]byte(key), pointIDTable)
 }
 
 func generateChunkID(c Chunk) string {
@@ -166,6 +174,34 @@ func getPayloadString(payload map[string]*qdrantpb.Value, key string) string {
 		}
 	}
 	return ""
+}
+
+func (s *QdrantStore) DeleteBySourceID(ctx context.Context, workspaceID, sourceID string) error {
+	if err := s.ensureCollection(ctx, workspaceID); err != nil {
+		return err
+	}
+	_, err := s.client.Delete(ctx, &qdrantpb.DeletePoints{
+		CollectionName: collectionName(workspaceID),
+		Points: &qdrantpb.PointsSelector{
+			PointsSelectorOneOf: &qdrantpb.PointsSelector_Filter{
+				Filter: &qdrantpb.Filter{
+					Must: []*qdrantpb.Condition{
+						{
+							ConditionOneOf: &qdrantpb.Condition_Field{
+								Field: &qdrantpb.FieldCondition{
+									Key: "source_id",
+									Match: &qdrantpb.Match{
+										MatchValue: &qdrantpb.Match_Keyword{Keyword: sourceID},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	return err
 }
 
 func (s *QdrantStore) DropCollection(ctx context.Context, workspaceID string) error {
