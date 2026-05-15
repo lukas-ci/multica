@@ -130,7 +130,7 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 			lastModified = page.Version.When
 		}
 
-		if since != nil && !since.IsZero() && !lastModified.IsZero() && !lastModified.After(*since) {
+		if since != nil && !since.IsZero() && !lastModified.IsZero() && !lastModified.After(since.Add(-time.Second)) {
 			continue
 		}
 

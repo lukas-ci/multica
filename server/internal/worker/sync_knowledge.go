@@ -85,8 +85,13 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 
 	// 7. Delete old points on first batch of full sync (non-fatal)
 	if checkpoint == "" && w.km != nil {
-		if err := w.km.DeleteSourcePoints(ctx, args.WorkspaceID, args.SourceID); err != nil {
-			slog.Warn("sync-knowledge worker: failed to delete old points", "source_id", args.SourceID, "error", err)
+		var cfg struct {
+			SpaceKey string `json:"space_key"`
+		}
+		if err := json.Unmarshal([]byte(configJSON), &cfg); err == nil && cfg.SpaceKey != "" {
+			if err := w.km.DeleteSourcePoints(ctx, args.WorkspaceID, cfg.SpaceKey); err != nil {
+				slog.Warn("sync-knowledge worker: failed to delete old points", "source_id", cfg.SpaceKey, "error", err)
+			}
 		}
 	}
 
@@ -218,11 +223,13 @@ func (m *Manager) RegisterPeriodicJobs() error {
 					continue
 				}
 				// Enqueue all but the first directly (constructor returns the first)
-				m.client.Insert(context.Background(), SyncKnowledgeArgs{
+				if _, err := m.client.Insert(context.Background(), SyncKnowledgeArgs{
 					SourceID:    id,
 					WorkspaceID: wsID,
 					SyncKind:    string(knowledge.SyncIncremental),
-				}, nil)
+				}, nil); err != nil {
+					slog.Warn("sync-knowledge: failed to enqueue periodic sync", "source_id", id, "error", err)
+				}
 			}
 			if firstID != "" {
 				return SyncKnowledgeArgs{
