@@ -36,6 +36,10 @@ func (m *Manager) DeleteSourcePoints(ctx context.Context, workspaceID, sourceID 
 	return m.store.DeleteBySourceID(ctx, workspaceID, sourceID)
 }
 
+func (m *Manager) DeleteSourcePointsByGeneration(ctx context.Context, workspaceID, sourceID string, generation int) error {
+	return m.store.DeleteBySourceIDAndGeneration(ctx, workspaceID, sourceID, generation)
+}
+
 func (m *Manager) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {
 	if req.Limit == 0 {
 		req.Limit = 10
@@ -44,7 +48,7 @@ func (m *Manager) Search(ctx context.Context, req SearchRequest) ([]SearchResult
 	if err != nil {
 		return nil, err
 	}
-	return m.store.Search(ctx, req.WorkspaceID, vecs[0], req.Limit, req.SourceTypes)
+	return m.store.Search(ctx, req.WorkspaceID, vecs[0], req.Limit, req.SourceTypes, req.IndexGenerations)
 }
 
 func (m *Manager) IndexChunks(ctx context.Context, workspaceID string, chunks []Chunk) error {

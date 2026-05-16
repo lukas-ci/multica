@@ -3,9 +3,9 @@ package knowledge
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"hash/crc64"
 	"net/http"
 	"strconv"
 	"strings"
@@ -83,7 +83,7 @@ func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []C
 
 	// Use REST API for upsert (gRPC Upsert silently fails on Qdrant 1.18.0)
 	type restPoint struct {
-		ID      uint64         `json:"id"`
+		ID      string         `json:"id"`
 		Vector  []float32      `json:"vector"`
 		Payload map[string]any `json:"payload"`
 	}
@@ -94,18 +94,19 @@ func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []C
 	points := make([]restPoint, len(chunks))
 	for i, c := range chunks {
 		payload := map[string]any{
-			"text":         c.Text,
-			"source_type":  string(c.SourceType),
-			"source_id":    c.SourceID,
-			"workspace_id": c.WorkspaceID,
-			"url":          c.URL,
-			"title":        c.Title,
-			"chunk_index":  c.ChunkIndex,
-			"total_chunks": c.TotalChunks,
-			"synced_at":    time.Now().UTC().Format(time.RFC3339),
+			"text":              c.Text,
+			"source_type":       string(c.SourceType),
+			"source_id":         c.SourceID,
+			"workspace_id":      c.WorkspaceID,
+			"url":               c.URL,
+			"title":             c.Title,
+			"chunk_index":       c.ChunkIndex,
+			"total_chunks":      c.TotalChunks,
+			"index_generation":  c.IndexGeneration,
+			"synced_at":         time.Now().UTC().Format(time.RFC3339),
 		}
 		points[i] = restPoint{
-			ID:      stablePointID(c.SourceID, c.PageID, c.ChunkIndex),
+			ID:      generatePointID(c.WorkspaceID, c.SourceID, c.IndexGeneration, c.PageID, c.ChunkIndex),
 			Vector:  vectors[i],
 			Payload: payload,
 		}
@@ -153,14 +154,18 @@ func (s *QdrantStore) CountPoints(ctx context.Context, workspaceID string) (uint
 	return resp.GetResult().Count, nil
 }
 
-var pointIDTable = crc64.MakeTable(crc64.ECMA)
-
-func stablePointID(sourceID, pageID string, chunkIndex int) uint64 {
-	key := sourceID + ":" + pageID + ":" + strconv.Itoa(chunkIndex)
-	return crc64.Checksum([]byte(key), pointIDTable)
+func generatePointID(workspaceID, sourceID string, indexGeneration int, pageID string, chunkIndex int) string {
+	key := workspaceID + ":" + sourceID + ":" + strconv.Itoa(indexGeneration) + ":" + pageID + ":" + strconv.Itoa(chunkIndex)
+	h := sha256.Sum256([]byte(key))
+	u := make([]byte, 16)
+	copy(u, h[:16])
+	u[6] = (u[6] & 0x0f) | 0x80
+	u[8] = (u[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
-func (s *QdrantStore) Search(ctx context.Context, workspaceID string, queryVector []float32, limit int, sourceTypes []SourceType) ([]SearchResult, error) {
+func (s *QdrantStore) Search(ctx context.Context, workspaceID string, queryVector []float32, limit int, sourceTypes []SourceType, generationFilter map[string]int) ([]SearchResult, error) {
 	if err := s.ensureCollection(ctx, workspaceID); err != nil {
 		return nil, err
 	}
@@ -180,6 +185,49 @@ func (s *QdrantStore) Search(ctx context.Context, workspaceID string, queryVecto
 			})
 		}
 		filter = &qdrantpb.Filter{Should: conditions}
+	}
+	if len(generationFilter) > 0 {
+		var genConditions []*qdrantpb.Condition
+		for sid, gen := range generationFilter {
+			genConditions = append(genConditions, &qdrantpb.Condition{
+				ConditionOneOf: &qdrantpb.Condition_Filter{
+					Filter: &qdrantpb.Filter{
+						Must: []*qdrantpb.Condition{
+							{
+								ConditionOneOf: &qdrantpb.Condition_Field{
+									Field: &qdrantpb.FieldCondition{
+										Key: "source_id",
+										Match: &qdrantpb.Match{
+											MatchValue: &qdrantpb.Match_Keyword{Keyword: sid},
+										},
+									},
+								},
+							},
+							{
+								ConditionOneOf: &qdrantpb.Condition_Field{
+									Field: &qdrantpb.FieldCondition{
+										Key: "index_generation",
+										Match: &qdrantpb.Match{
+											MatchValue: &qdrantpb.Match_Integer{Integer: int64(gen)},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+		}
+		genCond := &qdrantpb.Condition{
+			ConditionOneOf: &qdrantpb.Condition_Filter{
+				Filter: &qdrantpb.Filter{Should: genConditions},
+			},
+		}
+		if filter == nil {
+			filter = &qdrantpb.Filter{Must: []*qdrantpb.Condition{genCond}}
+		} else {
+			filter.Must = append(filter.Must, genCond)
+		}
 	}
 	results, err := s.client.Search(ctx, &qdrantpb.SearchPoints{
 		CollectionName: collectionName(workspaceID),
@@ -229,6 +277,44 @@ func (s *QdrantStore) DeleteBySourceID(ctx context.Context, workspaceID, sourceI
 									Key: "source_id",
 									Match: &qdrantpb.Match{
 										MatchValue: &qdrantpb.Match_Keyword{Keyword: sourceID},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	return err
+}
+
+func (s *QdrantStore) DeleteBySourceIDAndGeneration(ctx context.Context, workspaceID, sourceID string, generation int) error {
+	if err := s.ensureCollection(ctx, workspaceID); err != nil {
+		return err
+	}
+	_, err := s.client.Delete(ctx, &qdrantpb.DeletePoints{
+		CollectionName: collectionName(workspaceID),
+		Points: &qdrantpb.PointsSelector{
+			PointsSelectorOneOf: &qdrantpb.PointsSelector_Filter{
+				Filter: &qdrantpb.Filter{
+					Must: []*qdrantpb.Condition{
+						{
+							ConditionOneOf: &qdrantpb.Condition_Field{
+								Field: &qdrantpb.FieldCondition{
+									Key: "source_id",
+									Match: &qdrantpb.Match{
+										MatchValue: &qdrantpb.Match_Keyword{Keyword: sourceID},
+									},
+								},
+							},
+						},
+						{
+							ConditionOneOf: &qdrantpb.Condition_Field{
+								Field: &qdrantpb.FieldCondition{
+									Key: "index_generation",
+									Match: &qdrantpb.Match{
+										MatchValue: &qdrantpb.Match_Integer{Integer: int64(generation)},
 									},
 								},
 							},

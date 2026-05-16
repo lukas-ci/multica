@@ -10,16 +10,17 @@ const (
 )
 
 type Chunk struct {
-	Text        string            `json:"text"`
-	SourceType  SourceType        `json:"source_type"`
-	SourceID    string            `json:"source_id"`
-	PageID      string            `json:"page_id"`
-	WorkspaceID string            `json:"workspace_id"`
-	URL         string            `json:"url"`
-	Title       string            `json:"title"`
-	ChunkIndex  int               `json:"chunk_index"`
-	TotalChunks int               `json:"total_chunks"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+	Text            string            `json:"text"`
+	SourceType      SourceType        `json:"source_type"`
+	SourceID        string            `json:"source_id"`
+	PageID          string            `json:"page_id"`
+	WorkspaceID     string            `json:"workspace_id"`
+	URL             string            `json:"url"`
+	Title           string            `json:"title"`
+	ChunkIndex      int               `json:"chunk_index"`
+	TotalChunks     int               `json:"total_chunks"`
+	IndexGeneration int               `json:"index_generation"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
 }
 
 type SearchResult struct {
@@ -33,10 +34,11 @@ type SearchResult struct {
 }
 
 type SearchRequest struct {
-	WorkspaceID string       `json:"workspace_id"`
-	Query       string       `json:"query"`
-	SourceTypes []SourceType `json:"source_types,omitempty"`
-	Limit       int          `json:"limit,omitempty"`
+	WorkspaceID      string            `json:"workspace_id"`
+	Query            string            `json:"query"`
+	SourceTypes      []SourceType      `json:"source_types,omitempty"`
+	IndexGenerations map[string]int    `json:"index_generations,omitempty"` // source_id -> generation filter
+	Limit            int               `json:"limit,omitempty"`
 }
 
 type SyncKind string
