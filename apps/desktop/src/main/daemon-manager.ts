@@ -48,6 +48,15 @@ let pendingVersionRestart = false;
 let targetApiBaseUrl: string | null = null;
 let activeProfile: ActiveProfile | null = null;
 
+// Test helpers (only exported outside module; not used in production).
+// These let tests set module-level state without exporting the real mutables.
+export function __setTargetApiBaseUrl(url: string | null): void {
+  targetApiBaseUrl = url;
+}
+export function __setActiveProfile(profile: ActiveProfile | null): void {
+  activeProfile = profile;
+}
+
 // Serialize all writes to any profile config file. Multiple paths
 // (syncToken, resolveActiveProfile, clearToken, watch/unwatch handlers)
 // may try to write concurrently; chaining them avoids interleaved writes
@@ -211,7 +220,7 @@ async function writeProfileConfig(
  * profile whose name doesn't start with `desktop-`, so the user's manually
  * configured CLI profiles are untouched.
  */
-async function resolveActiveProfile(): Promise<ActiveProfile> {
+export async function resolveActiveProfile(): Promise<ActiveProfile> {
   const target = targetApiBaseUrl;
   if (!target) return { name: "", port: DEFAULT_HEALTH_PORT };
 
@@ -539,7 +548,7 @@ async function mintPat(jwt: string): Promise<string> {
  * - When we mint fresh and a daemon is already running, restart it so the
  *   new credentials take effect (the Go daemon reads config at startup).
  */
-async function syncToken(
+export async function syncToken(
   tokenFromRenderer: string,
   userId: string,
 ): Promise<void> {
@@ -650,7 +659,7 @@ export function desktopSpawnEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-async function startDaemon(): Promise<{ success: boolean; error?: string }> {
+export async function startDaemon(): Promise<{ success: boolean; error?: string }> {
   const bin = await resolveCliBinary();
   if (!bin) return { success: false, error: "multica CLI is not installed" };
 
