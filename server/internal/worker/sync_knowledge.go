@@ -76,7 +76,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	}
 
 	// 5. Set sync_status = 'syncing'
-	_, _ = w.pool.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing' WHERE id = $1`, srcUUID)
+	_, _ = w.pool.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1`, srcUUID)
 
 	// 6. FetchPage — error means River retries, do NOT save checkpoint
 	result, err := connector.FetchPage(ctx, args.WorkspaceID, string(configJSON), checkpoint, since)
@@ -135,7 +135,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	// 11. Last batch — finalize
 	_, err = w.pool.Exec(ctx, `
 		UPDATE knowledge_sources
-		SET sync_status = 'ready', last_synced_at = now(), total_pages = pages_fetched, checkpoint = ''
+		SET sync_status = 'ready', sync_error = NULL, last_synced_at = now(), total_pages = pages_fetched, checkpoint = ''
 		WHERE id = $1
 	`, srcUUID)
 	if err != nil {
