@@ -119,8 +119,16 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		slog.Warn("CreateKnowledgeSource: begin tx failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to create knowledge source")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
 	var id pgtype.UUID
-	err := h.DB.QueryRow(r.Context(), `
+	err = tx.QueryRow(r.Context(), `
 		INSERT INTO knowledge_sources (workspace_id, source_type, display_name, config)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id
@@ -137,10 +145,16 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 
 	sourceID := uuidToString(id)
 
-	if h.WorkerManager != nil {
-		if err := h.WorkerManager.InitAndEnqueueRun(r.Context(), sourceID, workspaceID, string(knowledge.SyncFull)); err != nil {
-			slog.Warn("CreateKnowledgeSource: failed to init and enqueue sync run", "error", err)
-		}
+	if err := h.WorkerManager.InitAndEnqueueRunTx(r.Context(), tx, sourceID, workspaceID, string(knowledge.SyncFull)); err != nil {
+		slog.Warn("CreateKnowledgeSource: failed to init and enqueue sync run", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to start initial sync")
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Warn("CreateKnowledgeSource: commit failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to create knowledge source")
+		return
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{"id": sourceID})

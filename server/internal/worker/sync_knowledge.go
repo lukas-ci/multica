@@ -380,6 +380,53 @@ func (m *Manager) InitAndEnqueueRun(ctx context.Context, sourceID, workspaceID, 
 	return tx.Commit(ctx)
 }
 
+func (m *Manager) InitAndEnqueueRunTx(ctx context.Context, tx pgx.Tx, sourceID, workspaceID, syncKind string) error {
+	lockKey := hashSourceID(sourceID)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		return fmt.Errorf("acquire advisory lock: %w", err)
+	}
+
+	var runID string
+	if syncKind == string(knowledge.SyncIncremental) {
+		err := tx.QueryRow(ctx, `
+			UPDATE knowledge_sources
+			SET sync_run_id = gen_random_uuid(), sync_started_at = now(), sync_heartbeat_at = now(),
+			    sync_watermark_at = now(),
+			    sync_index_generation = active_index_generation
+			WHERE id = $1 AND workspace_id = $2 AND sync_status != 'syncing'
+			RETURNING sync_run_id
+		`, parseUUID(sourceID), parseUUID(workspaceID)).Scan(&runID)
+		if err != nil {
+			return fmt.Errorf("init sync run: %w", err)
+		}
+	} else {
+		err := tx.QueryRow(ctx, `
+			UPDATE knowledge_sources
+			SET sync_run_id = gen_random_uuid(), sync_started_at = now(), sync_heartbeat_at = now(),
+			    sync_watermark_at = now(),
+			    sync_index_generation = active_index_generation + 1
+			WHERE id = $1 AND workspace_id = $2 AND sync_status != 'syncing'
+			RETURNING sync_run_id
+		`, parseUUID(sourceID), parseUUID(workspaceID)).Scan(&runID)
+		if err != nil {
+			return fmt.Errorf("init sync run: %w", err)
+		}
+	}
+
+	if _, err := m.client.InsertTx(ctx, tx, SyncKnowledgeArgs{
+		SourceID:          sourceID,
+		WorkspaceID:       workspaceID,
+		SyncKind:          syncKind,
+		SyncRunID:         runID,
+		Cursor:            "",
+		ExpectedCheckpoint: "",
+	}, nil); err != nil {
+		return fmt.Errorf("enqueue sync job: %w", err)
+	}
+
+	return nil
+}
+
 func NewManager(pool *pgxpool.Pool, km *knowledge.Manager) (*Manager, error) {
 	m := &Manager{pool: pool}
 
