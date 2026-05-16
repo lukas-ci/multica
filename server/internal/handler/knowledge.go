@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/knowledge"
 	"github.com/multica-ai/multica/server/internal/logger"
-	"github.com/multica-ai/multica/server/internal/worker"
 )
 
 const knowledgeEmptyIndexError = "knowledge source marked ready but index collection is empty; re-sync required"
@@ -139,12 +138,8 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	sourceID := uuidToString(id)
 
 	if h.WorkerManager != nil {
-		if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
-			SourceID:    sourceID,
-			WorkspaceID: workspaceID,
-			SyncKind:    string(knowledge.SyncFull),
-		}); err != nil {
-			slog.Warn("CreateKnowledgeSource: failed to enqueue sync job", "error", err)
+		if err := h.WorkerManager.InitAndEnqueueRun(r.Context(), sourceID, workspaceID, string(knowledge.SyncFull)); err != nil {
+			slog.Warn("CreateKnowledgeSource: failed to init and enqueue sync run", "error", err)
 		}
 	}
 
@@ -202,13 +197,25 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Parse config to extract source_id (space_key for Confluence)
-	var sourceIDInQdrant string
+	// Delete Qdrant points by canonical UUID (new-format points)
+	if h.KnowledgeManager != nil {
+		if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, sourceID, activeIndexGeneration); err != nil {
+			slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration canonical failed",
+				"workspace_id", workspaceID, "source_id", sourceID, "generation", activeIndexGeneration, "error", err)
+		}
+	}
+
+	// Parse config to extract space_key for legacy Qdrant points
 	var cfg struct {
 		SpaceKey string `json:"space_key"`
 	}
 	if err := json.Unmarshal(configJSON, &cfg); err == nil && cfg.SpaceKey != "" {
-		sourceIDInQdrant = cfg.SpaceKey
+		if h.KnowledgeManager != nil {
+			if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, cfg.SpaceKey, activeIndexGeneration); err != nil {
+				slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration legacy failed",
+					"workspace_id", workspaceID, "source_id", cfg.SpaceKey, "generation", activeIndexGeneration, "error", err)
+			}
+		}
 	}
 
 	// Delete DB row within the protected transaction
@@ -229,19 +236,6 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		slog.Warn("DeleteKnowledgeSource: commit failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
 		return
-	}
-
-	// Delete Qdrant points for this source — generation-specific then catch-all
-	if h.KnowledgeManager != nil && sourceIDInQdrant != "" {
-		if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, sourceIDInQdrant, activeIndexGeneration); err != nil {
-			slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration failed",
-				"workspace_id", workspaceID, "source_id", sourceIDInQdrant, "generation", activeIndexGeneration, "error", err)
-		}
-		// Catch-all: delete any remaining points from earlier generations
-		if err := h.KnowledgeManager.DeleteSourcePoints(r.Context(), workspaceID, sourceIDInQdrant); err != nil {
-			slog.Warn("DeleteKnowledgeSource: DeleteSourcePoints catch-all failed",
-				"workspace_id", workspaceID, "source_id", sourceIDInQdrant, "error", err)
-		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
