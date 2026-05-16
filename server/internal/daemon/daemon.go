@@ -105,6 +105,12 @@ type Daemon struct {
 	// goroutine can race against t.TempDir cleanup, leaving a partially
 	// deleted bare clone and an unrelated `not empty` cleanup failure.
 	bgSyncs sync.WaitGroup
+
+	// knowledgeProbeCache caches backend capability probe results so the
+	// daemon does not hammer an unsupported or known-to-fail backend on
+	// every task dispatch.
+	knowledgeProbeCache *knowledgeProbeCache
+	knowledgeProbeMu    sync.Mutex
 }
 
 // New creates a new Daemon instance.
@@ -127,6 +133,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		activeEnvRoots:        make(map[string]int),
 		runtimeGoneInflight:   make(map[string]struct{}),
 		reregisterNextAttempt: make(map[string]time.Time),
+		knowledgeProbeCache:   newKnowledgeProbeCache(),
 	}
 }
 
@@ -2140,8 +2147,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// backend has the knowledge service enabled. Merges into any
 	// existing agent-level MCP config so agents always discover it.
 	// URL resolution: override env → disable env → derivation from server URL.
+	// After resolving the URL, probe the backend for capability before injecting.
 	if baseURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL); baseURL != "" {
-		mcpConfig = mergeKnowledgeMCP(mcpConfig, baseURL, task.WorkspaceID)
+		switch cap := d.knowledgeMCPCapability(baseURL); cap {
+		case knowledgeCapSupported:
+			mcpConfig = mergeKnowledgeMCP(mcpConfig, baseURL, task.WorkspaceID)
+		case knowledgeCapAuthFailure:
+			d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", baseURL)
+		case knowledgeCapUnsupported:
+			d.logger.Info("knowledge MCP disabled: backend does not support knowledge service", "url", baseURL)
+		case knowledgeCapTransient:
+			d.logger.Warn("knowledge MCP disabled: backend unreachable", "url", baseURL)
+		}
 	}
 	// Two-tier model resolution: an explicit agent.model wins,
 	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
