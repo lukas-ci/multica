@@ -554,6 +554,62 @@ func TestInjectKnowledgeMCP_regression(t *testing.T) {
 	}
 }
 
+func TestInjectKnowledgeMCP_fallbackRegression(t *testing.T) {
+	// /api/capabilities 404 → fallback to /api/mcp → supported
+	var capabilitiesCalls atomic.Int32
+	var mcpCalls atomic.Int32
+	var wrongPathCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/capabilities":
+			capabilitiesCalls.Add(1)
+			w.WriteHeader(404)
+		case "/api/mcp":
+			mcpCalls.Add(1)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"result":{"tools":[{"name":"knowledge_search","description":"search"}]}}`))
+		default:
+			if strings.Contains(r.URL.Path, "/api/mcp/api/") {
+				wrongPathCalls.Add(1)
+			}
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		cfg: Config{
+			ServerBaseURL: srv.URL,
+		},
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	result := d.injectKnowledgeMCP(nil, "test-ws")
+
+	if capabilitiesCalls.Load() != 1 {
+		t.Fatalf("expected 1 /api/capabilities call, got %d", capabilitiesCalls.Load())
+	}
+	if mcpCalls.Load() != 1 {
+		t.Fatalf("expected 1 /api/mcp call (fallback), got %d", mcpCalls.Load())
+	}
+	if wrongPathCalls.Load() > 0 {
+		t.Fatalf("probe hit double-appended path %d times", wrongPathCalls.Load())
+	}
+	if result == nil {
+		t.Fatal("injectKnowledgeMCP returned nil, expected knowledge MCP config")
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	servers, ok := parsed["mcpServers"].(map[string]interface{})
+	if !ok || servers["knowledge"] == nil {
+		t.Fatalf("result missing knowledge tool: %v", parsed)
+	}
+}
+
 func TestInjectKnowledgeMCP_unsupportedBackend(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(404)
