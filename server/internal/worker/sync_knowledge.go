@@ -168,7 +168,23 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		result.Chunks[i].IndexGeneration = syncGen
 	}
 
-	// 9. Index chunks — error means River retries
+	// 9. For incremental: delete each page's existing points in active gen before re-indexing
+	// Handles shrunk pages (orphan chunks) and retry idempotency
+	if args.SyncKind == string(knowledge.SyncIncremental) && w.km != nil && len(result.Chunks) > 0 {
+		pageIDs := make(map[string]struct{})
+		for _, c := range result.Chunks {
+			if c.PageID != "" {
+				pageIDs[c.PageID] = struct{}{}
+			}
+		}
+		for pageID := range pageIDs {
+			if err := w.km.DeletePointsByPageID(ctx, args.WorkspaceID, args.SourceID, syncGen, pageID); err != nil {
+				slog.Warn("sync-knowledge: failed to clear page", "page_id", pageID, "error", err)
+			}
+		}
+	}
+
+	// 10. Index chunks — error means River retries
 	if len(result.Chunks) > 0 && w.km != nil {
 		if err := w.km.IndexChunks(ctx, args.WorkspaceID, result.Chunks); err != nil {
 			slog.Warn("sync-knowledge worker: index failed", "source_id", args.SourceID, "error", err)
@@ -176,7 +192,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		}
 	}
 
-	// 10. Short tx: save checkpoint conditionally on sync_run_id + expected_checkpoint
+	// 11. Short tx: save checkpoint conditionally on sync_run_id + expected_checkpoint
 	tx, err = conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin checkpoint tx: %w", err)
@@ -200,7 +216,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		return nil
 	}
 
-	// 11. Enqueue continuation within the same transaction
+	// 12. Enqueue continuation within the same transaction
 	if result.NextCursor != "" && w.insertTx != nil {
 		if err := w.insertTx(ctx, tx, SyncKnowledgeArgs{
 			SourceID:          args.SourceID,
@@ -238,7 +254,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		return fmt.Errorf("commit checkpoint tx: %w", err)
 	}
 
-	// 12. Short tx: last batch — finalize conditionally on sync_kind
+	// 13. Short tx: last batch — finalize conditionally on sync_kind
 	oldActiveGen := activeIndexGeneration
 
 	tx, err = conn.Begin(ctx)

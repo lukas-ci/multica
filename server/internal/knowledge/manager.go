@@ -40,6 +40,14 @@ func (m *Manager) DeleteSourcePointsByGeneration(ctx context.Context, workspaceI
 	return m.store.DeleteBySourceIDAndGeneration(ctx, workspaceID, sourceID, generation)
 }
 
+func (m *Manager) DeletePointsByPageID(ctx context.Context, workspaceID, sourceID string, generation int, pageID string) error {
+	return m.store.DeletePointsByPageID(ctx, workspaceID, sourceID, generation, pageID)
+}
+
+func (m *Manager) DeleteAllSourcePoints(ctx context.Context, workspaceID, sourceID string) error {
+	return m.store.DeleteAllBySourceID(ctx, workspaceID, sourceID)
+}
+
 func (m *Manager) Search(ctx context.Context, req SearchRequest) ([]SearchResult, error) {
 	if req.Limit == 0 {
 		req.Limit = 10

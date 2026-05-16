@@ -328,6 +328,49 @@ func (s *QdrantStore) DeleteBySourceIDAndGeneration(ctx context.Context, workspa
 	return err
 }
 
+func (s *QdrantStore) DeletePointsByPageID(ctx context.Context, workspaceID, sourceID string, generation int, pageID string) error {
+	return s.deleteByFilter(ctx, workspaceID, map[string]any{
+		"must": []map[string]any{
+			{"key": "source_id", "match": map[string]any{"value": sourceID}},
+			{"key": "index_generation", "match": map[string]any{"value": float64(generation)}},
+			{"key": "page_id", "match": map[string]any{"value": pageID}},
+		},
+	})
+}
+
+func (s *QdrantStore) DeleteAllBySourceID(ctx context.Context, workspaceID, sourceID string) error {
+	return s.deleteByFilter(ctx, workspaceID, map[string]any{
+		"must": []map[string]any{
+			{"key": "source_id", "match": map[string]any{"value": sourceID}},
+		},
+	})
+}
+
+func (s *QdrantStore) deleteByFilter(ctx context.Context, workspaceID string, filter map[string]any) error {
+	if err := s.ensureCollection(ctx, workspaceID); err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]any{"filter": filter})
+	if err != nil {
+		return fmt.Errorf("marshal delete filter: %w", err)
+	}
+	reqURL := fmt.Sprintf("%s/collections/%s/points/delete", s.httpURL, collectionName(workspaceID))
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("delete request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete points: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("delete points: HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (s *QdrantStore) DropCollection(ctx context.Context, workspaceID string) error {
 	name := collectionName(workspaceID)
 	_, err := s.collections.Delete(ctx, &qdrantpb.DeleteCollection{

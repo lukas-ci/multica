@@ -211,9 +211,8 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	}
 	defer h.releaseLock(conn, sourceID)
 
-	// Short tx: load config + generation, then delete the row
+	// Short tx: load config for legacy space_key, then delete the row
 	var configJSON json.RawMessage
-	var activeIndexGeneration int
 	tx, err := conn.Begin(r.Context())
 	if err != nil {
 		slog.Warn("DeleteKnowledgeSource: begin tx failed", append(logger.RequestAttrs(r), "error", err)...)
@@ -222,9 +221,8 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	}
 
 	err = tx.QueryRow(r.Context(), `
-		SELECT config, active_index_generation
-		FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
-	`, srcUUID, wsUUID).Scan(&configJSON, &activeIndexGeneration)
+		SELECT config FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
+	`, srcUUID, wsUUID).Scan(&configJSON)
 	if err != nil {
 		if isNotFound(err) {
 			tx.Rollback(r.Context())
@@ -259,21 +257,22 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Qdrant cleanup (outside tx, still under session lock — best-effort)
+	// Delete all generations for canonical source_id, then legacy space_key if different
 	if h.KnowledgeManager != nil {
-		if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, sourceID, activeIndexGeneration); err != nil {
-			slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration canonical failed",
-				"workspace_id", workspaceID, "source_id", sourceID, "generation", activeIndexGeneration, "error", err)
+		if err := h.KnowledgeManager.DeleteAllSourcePoints(r.Context(), workspaceID, sourceID); err != nil {
+			slog.Warn("DeleteKnowledgeSource: DeleteAllSourcePoints canonical failed",
+				"workspace_id", workspaceID, "source_id", sourceID, "error", err)
 		}
 	}
 
 	var cfg struct {
 		SpaceKey string `json:"space_key"`
 	}
-	if err := json.Unmarshal(configJSON, &cfg); err == nil && cfg.SpaceKey != "" {
+	if err := json.Unmarshal(configJSON, &cfg); err == nil && cfg.SpaceKey != "" && cfg.SpaceKey != sourceID {
 		if h.KnowledgeManager != nil {
-			if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, cfg.SpaceKey, activeIndexGeneration); err != nil {
-				slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration legacy failed",
-					"workspace_id", workspaceID, "source_id", cfg.SpaceKey, "generation", activeIndexGeneration, "error", err)
+			if err := h.KnowledgeManager.DeleteAllSourcePoints(r.Context(), workspaceID, cfg.SpaceKey); err != nil {
+				slog.Warn("DeleteKnowledgeSource: DeleteAllSourcePoints legacy failed",
+					"workspace_id", workspaceID, "source_id", cfg.SpaceKey, "error", err)
 			}
 		}
 	}
