@@ -7,10 +7,34 @@ import (
 	"strings"
 )
 
+// deriveKnowledgeMCPURL returns the Knowledge API base URL to use for MCP
+// injection. Resolution order:
+//  1. MULTICA_KNOWLEDGE_MCP_URL env var (explicit override, backward compat).
+//     If MULTICA_KNOWLEDGE_MCP_DISABLE is also set alongside this, disable wins.
+//  2. MULTICA_KNOWLEDGE_MCP_DISABLE env var (explicit disable).
+//  3. Derived from serverBaseURL as <serverBaseURL>/api/mcp.
+//
+// Returns empty string when Knowledge MCP should be disabled.
+func deriveKnowledgeMCPURL(serverBaseURL string) string {
+	override := os.Getenv("MULTICA_KNOWLEDGE_MCP_URL")
+	disabled := os.Getenv("MULTICA_KNOWLEDGE_MCP_DISABLE")
+
+	if override != "" && disabled == "" {
+		return override
+	}
+	if disabled != "" {
+		return ""
+	}
+	if serverBaseURL == "" {
+		return ""
+	}
+	return strings.TrimRight(serverBaseURL, "/") + "/api/mcp"
+}
+
 // mergeKnowledgeMCP merges the knowledge MCP server config into an existing
-// agent-level MCP config using the stdio transport (Cursor/CLaude expected format).
-// The MULTICA_KNOWLEDGE_MCP_URL env var is used as a feature toggle — when set,
-// the knowledge tool is injected. The value is the backend API base URL.
+// agent-level MCP config using the stdio transport (Cursor/Claude expected format).
+// The baseURL should come from deriveKnowledgeMCPURL so the resolution chain
+// (override env → disable env → derivation from server URL) is applied first.
 func mergeKnowledgeMCP(existing json.RawMessage, baseURL, workspaceID string) json.RawMessage {
 	// Find the script: look alongside the multica binary directory
 	scriptPath := resolveKnowledgeScript()

@@ -2139,7 +2139,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Framework-level: auto-inject knowledge_search MCP tool if the
 	// backend has the knowledge service enabled. Merges into any
 	// existing agent-level MCP config so agents always discover it.
-	if baseURL := os.Getenv("MULTICA_KNOWLEDGE_MCP_URL"); baseURL != "" {
+	// URL resolution: override env → disable env → derivation from server URL.
+	if baseURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL); baseURL != "" {
 		mcpConfig = mergeKnowledgeMCP(mcpConfig, baseURL, task.WorkspaceID)
 	}
 	// Two-tier model resolution: an explicit agent.model wins,
