@@ -51,19 +51,22 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	srcUUID := parseUUID(args.SourceID)
 	wsUUID := parseUUID(args.WorkspaceID)
 
-	// 1. Begin transaction + acquire advisory lock before any side effects
-	tx, err := w.pool.Begin(ctx)
+	// 1. Acquire dedicated connection for session-level lock
+	conn, err := w.pool.Acquire(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return fmt.Errorf("acquire connection: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer conn.Release()
 
 	lockKey := hashSourceID(args.SourceID)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
 		return fmt.Errorf("acquire advisory lock: %w", err)
 	}
+	defer func() {
+		conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockKey)
+	}()
 
-	// 2. Load source row + stale validation under the lock
+	// 2. Short tx: load source row + stale validation + set syncing status
 	var sourceType string
 	var configJSON json.RawMessage
 	var checkpoint string
@@ -74,6 +77,11 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	var legacyIndexMode bool
 	var syncWatermarkAt pgtype.Timestamptz
 
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+
 	err = tx.QueryRow(ctx, `
 		SELECT source_type, config, checkpoint, last_synced_at,
 		       sync_run_id::text, active_index_generation, sync_index_generation, legacy_index_mode,
@@ -83,11 +91,13 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	`, srcUUID, wsUUID).Scan(&sourceType, &configJSON, &checkpoint, &lastSyncedAt,
 		&dbSyncRunID, &activeIndexGeneration, &syncIndexGeneration, &legacyIndexMode, &syncWatermarkAt)
 	if err != nil {
+		tx.Rollback(ctx)
 		slog.Warn("sync-knowledge worker: source not found", "source_id", args.SourceID, "workspace_id", args.WorkspaceID, "error", err)
 		return nil
 	}
 
 	if args.SyncRunID != "" && (dbSyncRunID.String != args.SyncRunID || checkpoint != args.ExpectedCheckpoint) {
+		tx.Rollback(ctx)
 		slog.Info("sync-knowledge worker: stale job, discarding",
 			"source_id", args.SourceID,
 			"job_sync_run_id", args.SyncRunID,
@@ -97,26 +107,34 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		return nil
 	}
 
-	// 3. Update status and heartbeat within the transaction
 	if _, err := tx.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL, sync_heartbeat_at = now() WHERE id = $1`, srcUUID); err != nil {
+		tx.Rollback(ctx)
 		return fmt.Errorf("update sync status: %w", err)
 	}
 
-	// 4. Get connector
+	if err := tx.Commit(ctx); err != nil {
+		tx.Rollback(ctx)
+		return fmt.Errorf("commit load tx: %w", err)
+	}
+
+	// 3. Get connector
 	connector := sources.NewConnector(knowledge.SourceType(sourceType))
 	if connector == nil {
 		slog.Warn("sync-knowledge worker: unknown source type", "source_type", sourceType)
-		_, _ = tx.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'unknown source type' WHERE id = $1`, srcUUID)
+		if etx, cerr := conn.Begin(ctx); cerr == nil {
+			etx.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'error', sync_error = 'unknown source type' WHERE id = $1`, srcUUID)
+			etx.Commit(ctx)
+		}
 		return nil
 	}
 
-	// 5. Determine effective checkpoint (use args.Cursor for continuation jobs)
+	// 4. Determine effective checkpoint (use args.Cursor for continuation jobs)
 	effectiveCheckpoint := args.Cursor
 	if effectiveCheckpoint == "" {
 		effectiveCheckpoint = checkpoint
 	}
 
-	// 6. Determine since/until bounds
+	// 5. Determine since/until bounds
 	var since *time.Time
 	if args.SyncKind == string(knowledge.SyncIncremental) && lastSyncedAt.Valid {
 		t := lastSyncedAt.Time
@@ -128,7 +146,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		until = &t
 	}
 
-	// 7. FetchPage — error means River retries, tx rollback discards partial work
+	// 6. FetchPage — error means River retries; session lock is held across retries
 	result, err := connector.FetchPage(ctx, args.WorkspaceID, string(configJSON), args.SourceID, sources.FetchOptions{
 		Cursor: effectiveCheckpoint,
 		Since:  since,
@@ -139,18 +157,18 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		return err
 	}
 
-	// 8. Determine target generation for this sync run
+	// 7. Determine target generation for this sync run
 	syncGen := activeIndexGeneration + 1
 	if syncIndexGeneration.Valid {
 		syncGen = int(syncIndexGeneration.Int32)
 	}
 
-	// 9. Stamp chunks with the target sync generation
+	// 8. Stamp chunks with the target sync generation
 	for i := range result.Chunks {
 		result.Chunks[i].IndexGeneration = syncGen
 	}
 
-	// 10. Index chunks — error means River retries
+	// 9. Index chunks — error means River retries
 	if len(result.Chunks) > 0 && w.km != nil {
 		if err := w.km.IndexChunks(ctx, args.WorkspaceID, result.Chunks); err != nil {
 			slog.Warn("sync-knowledge worker: index failed", "source_id", args.SourceID, "error", err)
@@ -158,7 +176,12 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		}
 	}
 
-	// 11. Save checkpoint conditionally on sync_run_id + expected_checkpoint (no watermark mutation)
+	// 10. Short tx: save checkpoint conditionally on sync_run_id + expected_checkpoint
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin checkpoint tx: %w", err)
+	}
+
 	ct, err := tx.Exec(ctx, `
 		UPDATE knowledge_sources
 		SET checkpoint = $1, pages_fetched = pages_fetched + $2
@@ -167,15 +190,17 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		  AND checkpoint = $6
 	`, result.NextCursor, result.PageCount, srcUUID, wsUUID, args.SyncRunID, effectiveCheckpoint)
 	if err != nil {
+		tx.Rollback(ctx)
 		return fmt.Errorf("save checkpoint in tx: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
+		tx.Rollback(ctx)
 		slog.Warn("sync-knowledge worker: stale job, checkpoint update affected 0 rows",
 			"source_id", args.SourceID, "sync_run_id", args.SyncRunID)
 		return nil
 	}
 
-	// 12. Enqueue continuation within the same transaction
+	// 11. Enqueue continuation within the same transaction
 	if result.NextCursor != "" && w.insertTx != nil {
 		if err := w.insertTx(ctx, tx, SyncKnowledgeArgs{
 			SourceID:          args.SourceID,
@@ -185,33 +210,41 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 			Cursor:            result.NextCursor,
 			ExpectedCheckpoint: result.NextCursor,
 		}); err != nil {
+			tx.Rollback(ctx)
 			return fmt.Errorf("enqueue continuation in tx: %w", err)
 		}
 	}
 
 	if result.NextCursor != "" {
 		if err := tx.Commit(ctx); err != nil {
+			tx.Rollback(ctx)
 			return fmt.Errorf("commit checkpoint tx: %w", err)
+		}
+		if w.insertTx == nil && w.enqueue != nil {
+			w.enqueue(ctx, SyncKnowledgeArgs{
+				SourceID:          args.SourceID,
+				WorkspaceID:       args.WorkspaceID,
+				SyncKind:          args.SyncKind,
+				SyncRunID:         args.SyncRunID,
+				Cursor:            result.NextCursor,
+				ExpectedCheckpoint: result.NextCursor,
+			})
 		}
 		return nil
 	}
 
-	// Fallback: if no insertTx available, enqueue outside tx (best-effort)
-	if result.NextCursor != "" && w.insertTx == nil && w.enqueue != nil {
-		if err := w.enqueue(ctx, SyncKnowledgeArgs{
-			SourceID:          args.SourceID,
-			WorkspaceID:       args.WorkspaceID,
-			SyncKind:          args.SyncKind,
-			SyncRunID:         args.SyncRunID,
-			Cursor:            result.NextCursor,
-			ExpectedCheckpoint: result.NextCursor,
-		}); err != nil {
-			slog.Warn("sync-knowledge worker: re-enqueue failed", "source_id", args.SourceID, "error", err)
-		}
+	if err := tx.Commit(ctx); err != nil {
+		tx.Rollback(ctx)
+		return fmt.Errorf("commit checkpoint tx: %w", err)
 	}
 
-	// 13. Last batch — finalize conditionally on sync_kind
+	// 12. Short tx: last batch — finalize conditionally on sync_kind
 	oldActiveGen := activeIndexGeneration
+
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin finalize tx: %w", err)
+	}
 
 	if args.SyncKind == string(knowledge.SyncIncremental) {
 		ct, err = tx.Exec(ctx, `
@@ -248,15 +281,18 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		`, srcUUID, wsUUID, args.SyncRunID, result.NextCursor)
 	}
 	if err != nil {
+		tx.Rollback(ctx)
 		return fmt.Errorf("finalize sync: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
+		tx.Rollback(ctx)
 		slog.Warn("sync-knowledge worker: stale job, finalize update affected 0 rows",
 			"source_id", args.SourceID, "sync_run_id", args.SyncRunID)
 		return nil
 	}
 
 	if err := tx.Commit(ctx); err != nil {
+		tx.Rollback(ctx)
 		return fmt.Errorf("commit finalize: %w", err)
 	}
 
@@ -417,7 +453,7 @@ func (m *Manager) RegisterPeriodicJobs() error {
 		func() (river.JobArgs, *river.InsertOpts) {
 			ctx := context.Background()
 			rows, err := m.pool.Query(ctx, `
-				SELECT id, workspace_id FROM knowledge_sources WHERE sync_status = 'ready'
+				SELECT id, workspace_id FROM knowledge_sources WHERE sync_status = 'ready' AND NOT legacy_index_mode
 			`)
 			if err != nil {
 				slog.Warn("sync-knowledge: periodic query failed", "error", err)

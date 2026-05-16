@@ -30,17 +30,20 @@ func runKnowledgeSyncCleanup(ctx context.Context, pool *pgxpool.Pool) {
 				    sync_index_generation = NULL,
 				    sync_watermark_at = NULL
 				WHERE sync_status = 'syncing'
-				AND NOT EXISTS (
-				    SELECT 1 FROM river_job
-				    WHERE kind = 'sync_knowledge'
-				    AND args->>'source_id' = ks.id::text
-				    AND state IN ('available', 'running', 'retryable', 'scheduled')
-				)
 				AND EXISTS (
 				    SELECT 1 FROM river_job
 				    WHERE kind = 'sync_knowledge'
 				    AND args->>'source_id' = ks.id::text
 				    AND state = 'discarded'
+				    AND ks.sync_run_id IS NOT NULL
+				    AND (args->>'sync_run_id') IS NOT NULL
+				    AND args->>'sync_run_id' = ks.sync_run_id::text
+				)
+				AND NOT EXISTS (
+				    SELECT 1 FROM river_job
+				    WHERE kind = 'sync_knowledge'
+				    AND args->>'source_id' = ks.id::text
+				    AND state IN ('available', 'running', 'retryable', 'scheduled')
 				)
 			`)
 			if err != nil {
