@@ -641,8 +641,13 @@ export function profileArgs(active: ActiveProfile): string[] {
 // hide CLI self-update UI. Computed lazily so it picks up the PATH fix
 // applied by fix-path in main/index.ts — as a top-level const it would
 // snapshot process.env at import time, before that block runs.
+//
+// MULTICA_KNOWLEDGE_MCP_URL is explicitly stripped: the daemon's own URL
+// derivation (Task 1) must not be overridden by an inherited env var.
 export function desktopSpawnEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, MULTICA_LAUNCHED_BY: "desktop" };
+  const env = { ...process.env, MULTICA_LAUNCHED_BY: "desktop" };
+  delete env.MULTICA_KNOWLEDGE_MCP_URL;
+  return env;
 }
 
 async function startDaemon(): Promise<{ success: boolean; error?: string }> {
