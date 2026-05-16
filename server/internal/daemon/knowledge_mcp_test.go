@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -484,6 +487,117 @@ func TestKnowledgeMCPCapability_wiring_transient(t *testing.T) {
 	cap := d.knowledgeMCPCapability("http://127.0.0.1:1")
 	if cap != knowledgeCapTransient {
 		t.Fatalf("expected transient, got %v", cap)
+	}
+}
+
+// Regression test: injectKnowledgeMCP exercises the exact composition path
+// used by runTask. It must probe /api/capabilities (not /api/mcp/api/...).
+func TestInjectKnowledgeMCP_regression(t *testing.T) {
+	var capabilitiesCalls atomic.Int32
+	var mcpCalls atomic.Int32
+	var wrongPathCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/capabilities":
+			capabilitiesCalls.Add(1)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"knowledge":true}`))
+		case "/api/mcp":
+			mcpCalls.Add(1)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"result":{"tools":[{"name":"knowledge_search","description":"search"}]}}`))
+		default:
+			// If the probe hits /api/mcp/api/capabilities or similar, flag it
+			if strings.Contains(r.URL.Path, "/api/mcp/api/") {
+				wrongPathCalls.Add(1)
+			}
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		cfg: Config{
+			ServerBaseURL: srv.URL,
+		},
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	result := d.injectKnowledgeMCP(nil, "test-ws")
+
+	if capabilitiesCalls.Load() != 1 {
+		t.Fatalf("expected 1 /api/capabilities call, got %d; probes went to: %s",
+			capabilitiesCalls.Load(), srv.URL)
+	}
+	if wrongPathCalls.Load() > 0 {
+		t.Fatalf("probe hit double-appended path (e.g. /api/mcp/api/capabilities) %d times",
+			wrongPathCalls.Load())
+	}
+	if mcpCalls.Load() != 0 {
+		t.Fatalf("expected 0 /api/mcp calls (capabilities 200 shortcut), got %d", mcpCalls.Load())
+	}
+	if result == nil {
+		t.Fatal("injectKnowledgeMCP returned nil, expected knowledge MCP config")
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	servers, ok := parsed["mcpServers"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("result missing mcpServers key: %v", parsed)
+	}
+	if _, ok := servers["knowledge"]; !ok {
+		t.Fatalf("result missing knowledge tool in mcpServers: %v", servers)
+	}
+}
+
+func TestInjectKnowledgeMCP_unsupportedBackend(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		cfg: Config{
+			ServerBaseURL: srv.URL,
+		},
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	result := d.injectKnowledgeMCP(json.RawMessage(`{"mcpServers":{"existing":{"command":"echo","args":["hi"]}}}`), "test-ws")
+	if result == nil {
+		t.Fatal("expected unchanged config, got nil")
+	}
+	if !strings.Contains(string(result), "existing") {
+		t.Fatal("expected existing MCP config preserved when knowledge disabled")
+	}
+	if strings.Contains(string(result), "knowledge_search") {
+		t.Fatal("knowledge_search should not be injected for unsupported backend")
+	}
+}
+
+func TestInjectKnowledgeMCP_derivedURLDisable(t *testing.T) {
+	// When deriveKnowledgeMCPURL returns empty (disabled), injectKnowledgeMCP
+	// must return mcpConfig unchanged without probing.
+	os.Setenv("MULTICA_KNOWLEDGE_MCP_DISABLE", "1")
+	defer os.Unsetenv("MULTICA_KNOWLEDGE_MCP_DISABLE")
+
+	d := &Daemon{
+		cfg: Config{
+			ServerBaseURL: "http://localhost:8080",
+		},
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	original := json.RawMessage(`{"mcpServers":{"existing":{"command":"echo"}}}`)
+	result := d.injectKnowledgeMCP(original, "test-ws")
+	if string(result) != string(original) {
+		t.Fatalf("expected unchanged config when disabled, got %s", result)
 	}
 }
 

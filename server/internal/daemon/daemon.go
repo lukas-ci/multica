@@ -2144,24 +2144,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		mcpConfig = task.Agent.McpConfig
 	}
 	// Framework-level: auto-inject knowledge_search MCP tool if the
-	// backend has the knowledge service enabled. Merges into any
-	// existing agent-level MCP config so agents always discover it.
-	// URL resolution: override env → disable env → derivation from server URL.
-	// The probe always targets d.cfg.ServerBaseURL (backend root), not the
-	// derived MCP endpoint, so it hits /api/capabilities or /api/mcp correctly.
-	// A non-empty mcpURL means Knowledge MCP is not disabled by the user.
-	if mcpURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL); mcpURL != "" {
-		switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL); cap {
-		case knowledgeCapSupported:
-			mcpConfig = mergeKnowledgeMCP(mcpConfig, mcpURL, task.WorkspaceID)
-		case knowledgeCapAuthFailure:
-			d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", mcpURL)
-		case knowledgeCapUnsupported:
-			d.logger.Info("knowledge MCP disabled: backend does not support knowledge service", "url", mcpURL)
-		case knowledgeCapTransient:
-			d.logger.Warn("knowledge MCP disabled: backend unreachable", "url", mcpURL)
-		}
-	}
+	// backend supports it. Delegates to injectKnowledgeMCP so the exact
+	// URL resolution → probe → injection path is testable in one call.
+	mcpConfig = d.injectKnowledgeMCP(mcpConfig, task.WorkspaceID)
 	// Two-tier model resolution: an explicit agent.model wins,
 	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
 	// both are empty we deliberately pass "" through — each

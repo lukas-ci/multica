@@ -201,6 +201,27 @@ func shortTokenHash(token string) string {
 	return fmt.Sprintf("%x", h[:4])
 }
 
+// injectKnowledgeMCP resolves the Knowledge MCP URL, probes the backend for
+// capability, and injects the knowledge_search tool into mcpConfig when the
+// backend supports it. This is the exact composition used by runTask.
+func (d *Daemon) injectKnowledgeMCP(mcpConfig json.RawMessage, workspaceID string) json.RawMessage {
+	mcpURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL)
+	if mcpURL == "" {
+		return mcpConfig
+	}
+	switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL); cap {
+	case knowledgeCapSupported:
+		return mergeKnowledgeMCP(mcpConfig, mcpURL, workspaceID)
+	case knowledgeCapAuthFailure:
+		d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", mcpURL)
+	case knowledgeCapUnsupported:
+		d.logger.Info("knowledge MCP disabled: backend does not support knowledge service", "url", mcpURL)
+	case knowledgeCapTransient:
+		d.logger.Warn("knowledge MCP disabled: backend unreachable", "url", mcpURL)
+	}
+	return mcpConfig
+}
+
 // knowledgeMCPCapability probes the backend at serverBaseURL (the backend root,
 // e.g. "http://localhost:8080") for Knowledge MCP support, consulting and
 // updating the probe cache. Concurrent callers for the same (serverURL, token)
