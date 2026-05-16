@@ -2,21 +2,24 @@ package worker
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/knowledge"
 	"github.com/multica-ai/multica/server/internal/knowledge/sources"
+	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
 	"github.com/riverqueue/river/rivertype"
-	"github.com/multica-ai/multica/server/internal/util"
 )
 
 type SyncKnowledgeArgs struct {
@@ -85,8 +88,9 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		}
 	}
 
-	// 3. Update heartbeat
+	// 3. Heartbeat + sync_status update (outside tx — visible immediately)
 	_, _ = w.pool.Exec(ctx, `UPDATE knowledge_sources SET sync_heartbeat_at = now() WHERE id = $1`, srcUUID)
+	_, _ = w.pool.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1`, srcUUID)
 
 	// 4. Get connector
 	connector := sources.NewConnector(knowledge.SourceType(sourceType))
@@ -114,10 +118,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		until = &t
 	}
 
-	// 7. Set sync_status = 'syncing' (idempotent)
-	_, _ = w.pool.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1`, srcUUID)
-
-	// 8. FetchPage — error means River retries, do NOT save checkpoint
+	// 7. FetchPage — error means River retries, do NOT save checkpoint
 	result, err := connector.FetchPage(ctx, args.WorkspaceID, string(configJSON), args.SourceID, sources.FetchOptions{
 		Cursor: effectiveCheckpoint,
 		Since:  since,
@@ -128,18 +129,18 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		return err
 	}
 
-	// 9. Determine target generation for this sync run
+	// 8. Determine target generation for this sync run
 	syncGen := activeIndexGeneration + 1
 	if syncIndexGeneration.Valid {
 		syncGen = int(syncIndexGeneration.Int32)
 	}
 
-	// 10. Stamp chunks with the target sync generation
+	// 9. Stamp chunks with the target sync generation
 	for i := range result.Chunks {
 		result.Chunks[i].IndexGeneration = syncGen
 	}
 
-	// 11. Index chunks — error means River retries, do NOT save checkpoint
+	// 10. Index chunks — error means River retries, do NOT save checkpoint
 	if len(result.Chunks) > 0 && w.km != nil {
 		if err := w.km.IndexChunks(ctx, args.WorkspaceID, result.Chunks); err != nil {
 			slog.Warn("sync-knowledge worker: index failed", "source_id", args.SourceID, "error", err)
@@ -147,22 +148,36 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		}
 	}
 
-	// 12. Save checkpoint in transaction + optionally enqueue continuation
+	// 11. Open transaction + acquire advisory lock for protected write operations
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx for checkpoint: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx, `
+	lockKey := hashSourceID(args.SourceID)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		return fmt.Errorf("acquire advisory lock: %w", err)
+	}
+
+	// 12. Save checkpoint conditionally on sync_run_id + expected_checkpoint
+	ct, err := tx.Exec(ctx, `
 		UPDATE knowledge_sources
 		SET checkpoint = $1, pages_fetched = pages_fetched + $2, sync_watermark_at = now()
-		WHERE id = $3
-	`, result.NextCursor, result.PageCount, srcUUID)
+		WHERE id = $3 AND workspace_id = $4
+		  AND ($5 = '' AND sync_run_id IS NULL OR sync_run_id::text = $5)
+		  AND checkpoint = $6
+	`, result.NextCursor, result.PageCount, srcUUID, wsUUID, args.SyncRunID, effectiveCheckpoint)
 	if err != nil {
 		return fmt.Errorf("save checkpoint in tx: %w", err)
 	}
+	if ct.RowsAffected() == 0 {
+		slog.Warn("sync-knowledge worker: stale job, checkpoint update affected 0 rows",
+			"source_id", args.SourceID, "sync_run_id", args.SyncRunID)
+		return nil
+	}
 
+	// 13. Enqueue continuation within the same transaction
 	if result.NextCursor != "" && w.insertTx != nil {
 		if err := w.insertTx(ctx, tx, SyncKnowledgeArgs{
 			SourceID:          args.SourceID,
@@ -176,8 +191,11 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit checkpoint tx: %w", err)
+	if result.NextCursor != "" {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit checkpoint tx: %w", err)
+		}
+		return nil
 	}
 
 	// Fallback: if no insertTx available, enqueue outside tx (best-effort)
@@ -193,19 +211,10 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 			slog.Warn("sync-knowledge worker: re-enqueue failed", "source_id", args.SourceID, "error", err)
 		}
 	}
-	if result.NextCursor != "" {
-		return nil
-	}
 
-	// 13. Last batch — finalize in transaction with generation promotion
+	// 14. Last batch — finalize conditionally on sync_run_id + checkpoint
 	oldActiveGen := activeIndexGeneration
-	tx2, err := w.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx for finalize: %w", err)
-	}
-	defer tx2.Rollback(ctx)
-
-	_, err = tx2.Exec(ctx, `
+	ct, err = tx.Exec(ctx, `
 		UPDATE knowledge_sources
 		SET sync_status = 'ready', sync_error = NULL,
 		    last_synced_at = COALESCE(sync_watermark_at, now()),
@@ -218,13 +227,20 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		    sync_index_generation = NULL,
 		    sync_watermark_at = NULL,
 		    legacy_index_mode = false
-		WHERE id = $1
-	`, srcUUID)
+		WHERE id = $1 AND workspace_id = $2
+		  AND ($3 = '' AND sync_run_id IS NULL OR sync_run_id::text = $3)
+		  AND checkpoint = $4
+	`, srcUUID, wsUUID, args.SyncRunID, result.NextCursor)
 	if err != nil {
 		return fmt.Errorf("finalize sync: %w", err)
 	}
+	if ct.RowsAffected() == 0 {
+		slog.Warn("sync-knowledge worker: stale job, finalize update affected 0 rows",
+			"source_id", args.SourceID, "sync_run_id", args.SyncRunID)
+		return nil
+	}
 
-	if err := tx2.Commit(ctx); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit finalize: %w", err)
 	}
 
@@ -248,9 +264,63 @@ func parseUUID(s string) pgtype.UUID {
 	return u
 }
 
+func hashSourceID(id string) int64 {
+	h := sha1.New()
+	h.Write([]byte(id))
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
 type Manager struct {
 	client *river.Client[pgx.Tx]
 	pool   *pgxpool.Pool
+}
+
+func (m *Manager) InsertTx(ctx context.Context, tx pgx.Tx, args SyncKnowledgeArgs) error {
+	_, err := m.client.InsertTx(ctx, tx, args, nil)
+	return err
+}
+
+func (m *Manager) InitAndEnqueueRun(ctx context.Context, sourceID, workspaceID, syncKind string) error {
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	lockKey := hashSourceID(sourceID)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		return fmt.Errorf("acquire advisory lock: %w", err)
+	}
+
+	syncRunID := uuid.NewString()
+	srcUUID := parseUUID(sourceID)
+	ct, err := tx.Exec(ctx, `
+		UPDATE knowledge_sources
+		SET checkpoint = '', pages_fetched = 0, total_pages = NULL,
+		    sync_kind = $3,
+		    sync_run_id = $1, sync_started_at = now(), sync_heartbeat_at = now(),
+		    sync_watermark_at = now(),
+		    sync_index_generation = active_index_generation + 1
+		WHERE id = $2 AND sync_status != 'syncing'
+	`, syncRunID, srcUUID, syncKind)
+	if err != nil {
+		return fmt.Errorf("init sync run: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("source not found or already syncing")
+	}
+
+	if _, err := m.client.InsertTx(ctx, tx, SyncKnowledgeArgs{
+		SourceID:    sourceID,
+		WorkspaceID: workspaceID,
+		SyncKind:    syncKind,
+		SyncRunID:   syncRunID,
+	}, nil); err != nil {
+		return fmt.Errorf("enqueue sync job: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 func NewManager(pool *pgxpool.Pool, km *knowledge.Manager) (*Manager, error) {
@@ -324,7 +394,8 @@ func (m *Manager) RegisterPeriodicJobs() error {
 	m.client.PeriodicJobs().Add(river.NewPeriodicJob(
 		river.PeriodicInterval(24*time.Hour),
 		func() (river.JobArgs, *river.InsertOpts) {
-			rows, err := m.pool.Query(context.Background(), `
+			ctx := context.Background()
+			rows, err := m.pool.Query(ctx, `
 				SELECT id, workspace_id FROM knowledge_sources WHERE sync_status = 'ready'
 			`)
 			if err != nil {
@@ -333,31 +404,14 @@ func (m *Manager) RegisterPeriodicJobs() error {
 			}
 			defer rows.Close()
 
-			var firstID, firstWS string
 			for rows.Next() {
 				var id, wsID string
 				if err := rows.Scan(&id, &wsID); err != nil {
 					continue
 				}
-				if firstID == "" {
-					firstID, firstWS = id, wsID
-					continue
+				if err := m.InitAndEnqueueRun(ctx, id, wsID, string(knowledge.SyncIncremental)); err != nil {
+					slog.Warn("sync-knowledge: periodic init failed", "source_id", id, "error", err)
 				}
-				// Enqueue all but the first directly (constructor returns the first)
-				if _, err := m.client.Insert(context.Background(), SyncKnowledgeArgs{
-					SourceID:    id,
-					WorkspaceID: wsID,
-					SyncKind:    string(knowledge.SyncIncremental),
-				}, nil); err != nil {
-					slog.Warn("sync-knowledge: failed to enqueue periodic sync", "source_id", id, "error", err)
-				}
-			}
-			if firstID != "" {
-				return SyncKnowledgeArgs{
-					SourceID:    firstID,
-					WorkspaceID: firstWS,
-					SyncKind:    string(knowledge.SyncIncremental),
-				}, nil
 			}
 			return nil, nil
 		},

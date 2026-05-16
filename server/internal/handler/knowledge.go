@@ -10,7 +10,6 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/knowledge"
 	"github.com/multica-ai/multica/server/internal/logger"
@@ -169,9 +168,17 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Acquire advisory lock for this source
+	// Use explicit transaction with advisory lock spanning all DB operations
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		slog.Warn("DeleteKnowledgeSource: begin tx failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to acquire lock")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
 	lockKey := hashSourceID(sourceID)
-	if _, err := h.DB.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
 		slog.Warn("DeleteKnowledgeSource: advisory lock failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to acquire lock")
 		return
@@ -181,7 +188,7 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	var configJSON json.RawMessage
 	var activeIndexGeneration int
 	var syncRunID pgtype.UUID
-	err := h.DB.QueryRow(r.Context(), `
+	err = tx.QueryRow(r.Context(), `
 		SELECT config, active_index_generation, sync_run_id
 		FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
 	`, srcUUID, wsUUID).Scan(&configJSON, &activeIndexGeneration, &syncRunID)
@@ -204,8 +211,8 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		sourceIDInQdrant = cfg.SpaceKey
 	}
 
-	// Delete DB row
-	result, err := h.DB.Exec(r.Context(), `
+	// Delete DB row within the protected transaction
+	result, err := tx.Exec(r.Context(), `
 		DELETE FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
 	`, srcUUID, wsUUID)
 	if err != nil {
@@ -215,6 +222,12 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	}
 	if result.RowsAffected() == 0 {
 		writeError(w, http.StatusNotFound, "knowledge source not found")
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Warn("DeleteKnowledgeSource: commit failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
 		return
 	}
 
@@ -281,35 +294,9 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Acquire advisory lock for this source to prevent concurrent sync/delete
-	lockKey := hashSourceID(sourceID)
-	if _, err := h.DB.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
-		slog.Warn("SyncKnowledgeSource: advisory lock failed", append(logger.RequestAttrs(r), "error", err)...)
-		writeError(w, http.StatusInternalServerError, "failed to acquire sync lock")
-		return
-	}
-
-	// Create a new sync run (reset state + bump generation + set run ID)
-	syncRunID := uuid.NewString()
-	if _, err := h.DB.Exec(r.Context(), `
-		UPDATE knowledge_sources
-		SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full',
-		    sync_run_id = $1, sync_started_at = now(), sync_heartbeat_at = now(),
-		    sync_index_generation = active_index_generation + 1
-		WHERE id = $2
-	`, syncRunID, srcUUID); err != nil {
-		slog.Warn("SyncKnowledgeSource: failed to initialize sync run", append(logger.RequestAttrs(r), "error", err)...)
-		writeError(w, http.StatusInternalServerError, "failed to start sync")
-		return
-	}
-
-	if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
-		SourceID:    sourceID,
-		WorkspaceID: workspaceID,
-		SyncKind:    string(knowledge.SyncFull),
-		SyncRunID:   syncRunID,
-	}); err != nil {
-		slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
+	// Init run + enqueue atomically (advisory lock + sync_run_id + River job within a single tx)
+	if err := h.WorkerManager.InitAndEnqueueRun(r.Context(), sourceID, workspaceID, string(knowledge.SyncFull)); err != nil {
+		slog.Warn("SyncKnowledgeSource: failed to init sync run", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to start sync")
 		return
 	}
