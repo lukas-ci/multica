@@ -188,6 +188,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		for pageID, total := range pageTotals {
 			if err := w.km.DeleteStalePageChunks(ctx, args.WorkspaceID, args.SourceID, gen, pageID, total); err != nil {
 				slog.Warn("sync-knowledge: stale cleanup failed", "page_id", pageID, "error", err)
+				return err
 			}
 		}
 	}
