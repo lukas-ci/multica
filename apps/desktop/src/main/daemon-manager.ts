@@ -57,11 +57,32 @@ export function __setActiveProfile(profile: ActiveProfile | null): void {
   activeProfile = profile;
 }
 
+// When set, overrides os.homedir() for profile paths so tests can use temp
+// directories without mocking the os module. Production code never sets this.
+let testHomeDir: string | null = null;
+export function __setTestHomeDir(dir: string | null): void {
+  testHomeDir = dir;
+}
+
+// When set, skips findCliOnPath/bundledCliPath and returns this value directly.
+// Used by tests to avoid mocking Electron's app.getAppPath().
+let testCliBinary: string | null = null;
+export function __setTestCliBinary(bin: string | null): void {
+  testCliBinary = bin;
+}
+
 // Serialize all writes to any profile config file. Multiple paths
 // (syncToken, resolveActiveProfile, clearToken, watch/unwatch handlers)
 // may try to write concurrently; chaining them avoids interleaved writes
 // corrupting the JSON.
 let configWriteChain: Promise<void> = Promise.resolve();
+
+// Test seam: when set, startDaemon uses this instead of the real execFile.
+// Avoids vitest ESM mock hoisting issues with child_process.
+let testExecFile: ((...args: any[]) => any) | null = null;
+export function __setTestExecFile(fn: ((...args: any[]) => any) | null): void {
+  testExecFile = fn;
+}
 
 // Keep the Go impl in sync: server/cmd/multica/cmd_daemon.go healthPortForProfile.
 export function healthPortForProfile(profile: string): number {
@@ -72,9 +93,10 @@ export function healthPortForProfile(profile: string): number {
 }
 
 export function profileDir(profile: string): string {
+  const home = testHomeDir ?? homedir();
   return profile
-    ? join(homedir(), ".multica", "profiles", profile)
-    : join(homedir(), ".multica");
+    ? join(home, ".multica", "profiles", profile)
+    : join(home, ".multica");
 }
 
 export function profileConfigPath(profile: string): string {
@@ -372,6 +394,7 @@ async function probeCliBinary(
  * installs are de-duplicated via `cliResolvePromise`.
  */
 async function resolveCliBinary(): Promise<string | null> {
+  if (testCliBinary) return testCliBinary;
   if (cachedCliBinary !== undefined) return cachedCliBinary;
   if (cliResolvePromise) return cliResolvePromise;
 
@@ -676,11 +699,12 @@ export async function startDaemon(): Promise<{ success: boolean; error?: string 
   const args = ["daemon", "start", ...profileArgs(active)];
 
   return new Promise((resolve) => {
-    execFile(
+    const spawnFn = testExecFile ?? execFile;
+    spawnFn(
       bin,
       args,
       { timeout: 20_000, env: desktopSpawnEnv() },
-      (err) => {
+      (err: any) => {
         if (err) {
           currentState = "stopped";
           sendStatus({ state: "stopped" });
