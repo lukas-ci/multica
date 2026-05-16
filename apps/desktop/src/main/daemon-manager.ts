@@ -28,7 +28,7 @@ const LOG_TAIL_MAX_RETRIES = 5;
 
 const DEFAULT_PREFS: DaemonPrefs = { autoStart: true, autoStop: false };
 
-interface ActiveProfile {
+export interface ActiveProfile {
   name: string; // "" = default profile
   port: number;
 }
@@ -55,20 +55,20 @@ let activeProfile: ActiveProfile | null = null;
 let configWriteChain: Promise<void> = Promise.resolve();
 
 // Keep the Go impl in sync: server/cmd/multica/cmd_daemon.go healthPortForProfile.
-function healthPortForProfile(profile: string): number {
+export function healthPortForProfile(profile: string): number {
   if (!profile) return DEFAULT_HEALTH_PORT;
   let sum = 0;
   for (const b of Buffer.from(profile, "utf-8")) sum += b;
   return DEFAULT_HEALTH_PORT + 1 + (sum % 1000);
 }
 
-function profileDir(profile: string): string {
+export function profileDir(profile: string): string {
   return profile
     ? join(homedir(), ".multica", "profiles", profile)
     : join(homedir(), ".multica");
 }
 
-function profileConfigPath(profile: string): string {
+export function profileConfigPath(profile: string): string {
   return join(profileDir(profile), "config.json");
 }
 
@@ -110,7 +110,7 @@ async function removeProfileUserId(profile: string): Promise<void> {
   }
 }
 
-function normalizeUrl(u: string): string {
+export function normalizeUrl(u: string): string {
   if (!u) return "";
   try {
     const parsed = new URL(u);
@@ -120,7 +120,7 @@ function normalizeUrl(u: string): string {
   }
 }
 
-function urlsMatch(a: string, b: string): boolean {
+export function urlsMatch(a: string, b: string): boolean {
   const na = normalizeUrl(a);
   const nb = normalizeUrl(b);
   return na.length > 0 && na === nb;
@@ -164,7 +164,7 @@ async function fetchHealthAtPort(
 // Desktop owns a dedicated CLI profile named after the target API host, so it
 // never reads or writes the user's hand-configured profiles. Profile dir:
 //   ~/.multica/profiles/desktop-<host>/
-function deriveProfileName(targetUrl: string): string {
+export function deriveProfileName(targetUrl: string): string {
   try {
     const url = new URL(targetUrl);
     const host = url.host.replace(/:/g, "-").toLowerCase();
@@ -632,7 +632,7 @@ async function withGuard<T>(fn: () => Promise<T>): Promise<T | { success: false;
   }
 }
 
-function profileArgs(active: ActiveProfile): string[] {
+export function profileArgs(active: ActiveProfile): string[] {
   return active.name ? ["--profile", active.name] : [];
 }
 
@@ -641,7 +641,7 @@ function profileArgs(active: ActiveProfile): string[] {
 // hide CLI self-update UI. Computed lazily so it picks up the PATH fix
 // applied by fix-path in main/index.ts — as a top-level const it would
 // snapshot process.env at import time, before that block runs.
-function desktopSpawnEnv(): NodeJS.ProcessEnv {
+export function desktopSpawnEnv(): NodeJS.ProcessEnv {
   return { ...process.env, MULTICA_LAUNCHED_BY: "desktop" };
 }
 
