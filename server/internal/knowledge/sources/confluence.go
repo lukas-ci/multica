@@ -54,7 +54,7 @@ type confluenceSearchResult struct {
 	} `json:"_links"`
 }
 
-func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, configJSON, cursor string, since *time.Time) (*PageResult, error) {
+func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, configJSON, sourceID string, opts FetchOptions) (*PageResult, error) {
 	var cfg ConfluenceConfig
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -76,12 +76,12 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
 
 	reqURL := fmt.Sprintf("%s/wiki/rest/api/content?spaceKey=%s&expand=body.storage,version&limit=25", baseURL, cfg.SpaceKey)
-	if cursor != "" {
-		decoded, err := url.QueryUnescape(cursor)
+	if opts.Cursor != "" {
+		decoded, err := url.QueryUnescape(opts.Cursor)
 		if err == nil {
 			reqURL = decoded
 		} else {
-			slog.Warn("confluence fetch: failed to decode cursor, starting from page 1", "cursor", cursor, "error", err)
+			slog.Warn("confluence fetch: failed to decode cursor, starting from page 1", "cursor", opts.Cursor, "error", err)
 		}
 	}
 
@@ -130,13 +130,16 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 			lastModified = page.Version.When
 		}
 
-		if since != nil && !since.IsZero() && !lastModified.IsZero() && !lastModified.After(since.Add(-time.Second)) {
+		if opts.Since != nil && !opts.Since.IsZero() && !lastModified.IsZero() && !lastModified.After(opts.Since.Add(-time.Second)) {
+			continue
+		}
+		if opts.Until != nil && !opts.Until.IsZero() && !lastModified.IsZero() && lastModified.After(*opts.Until) {
 			continue
 		}
 
 		pageCount++
 
-		pageChunks := chunkPage(page, workspaceID, cfg.SpaceKey)
+		pageChunks := chunkPage(page, workspaceID, sourceID, cfg.SpaceKey)
 		chunks = append(chunks, pageChunks...)
 	}
 
@@ -158,7 +161,7 @@ func (c *ConfluenceConnector) FetchPage(ctx context.Context, workspaceID, config
 	}, nil
 }
 
-func chunkPage(page confluencePage, workspaceID, spaceKey string) []knowledge.Chunk {
+func chunkPage(page confluencePage, workspaceID, sourceID, spaceKey string) []knowledge.Chunk {
 	text := stripHTML(page.Body.Storage.Value)
 	if strings.TrimSpace(text) == "" {
 		return nil
@@ -178,7 +181,7 @@ func chunkPage(page confluencePage, workspaceID, spaceKey string) []knowledge.Ch
 		if len(chunkText) > maxChunkChars {
 			chunkText = chunkText[:maxChunkChars]
 		}
-		chunks = append(chunks, makeChunk(chunkText, page, workspaceID, spaceKey, len(chunks), 0))
+		chunks = append(chunks, makeChunk(chunkText, page, workspaceID, sourceID, spaceKey, len(chunks), 0))
 	}
 
 	for i := range chunks {
@@ -235,16 +238,17 @@ func stripHTML(html string) string {
 	return out.String()
 }
 
-func makeChunk(text string, page confluencePage, workspaceID, spaceKey string, idx, total int) knowledge.Chunk {
+func makeChunk(text string, page confluencePage, workspaceID, sourceID, spaceKey string, idx, total int) knowledge.Chunk {
 	return knowledge.Chunk{
 		Text:        text,
 		SourceType:  knowledge.SourceConfluence,
-		SourceID:    spaceKey,
+		SourceID:    sourceID,
 		PageID:      page.ID,
 		WorkspaceID: workspaceID,
 		URL:         page.Links.WebUI,
 		Title:       page.Title,
 		ChunkIndex:  idx,
 		TotalChunks: total,
+		Metadata:    map[string]string{"space_key": spaceKey},
 	}
 }

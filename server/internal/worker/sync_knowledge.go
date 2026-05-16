@@ -58,14 +58,16 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	var activeIndexGeneration int
 	var syncIndexGeneration pgtype.Int4
 	var legacyIndexMode bool
+	var syncWatermarkAt pgtype.Timestamptz
 
 	err := w.pool.QueryRow(ctx, `
 		SELECT source_type, config, checkpoint, last_synced_at,
-		       sync_run_id, active_index_generation, sync_index_generation, legacy_index_mode
+		       sync_run_id, active_index_generation, sync_index_generation, legacy_index_mode,
+		       sync_watermark_at
 		FROM knowledge_sources
 		WHERE id = $1 AND workspace_id = $2
 	`, srcUUID, wsUUID).Scan(&sourceType, &configJSON, &checkpoint, &lastSyncedAt,
-		&dbSyncRunID, &activeIndexGeneration, &syncIndexGeneration, &legacyIndexMode)
+		&dbSyncRunID, &activeIndexGeneration, &syncIndexGeneration, &legacyIndexMode, &syncWatermarkAt)
 	if err != nil {
 		slog.Warn("sync-knowledge worker: source not found", "source_id", args.SourceID, "workspace_id", args.WorkspaceID, "error", err)
 		return nil
@@ -100,18 +102,27 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		effectiveCheckpoint = checkpoint
 	}
 
-	// 6. Determine since
+	// 6. Determine since/until bounds
 	var since *time.Time
 	if args.SyncKind == string(knowledge.SyncIncremental) && lastSyncedAt.Valid {
 		t := lastSyncedAt.Time
 		since = &t
+	}
+	var until *time.Time
+	if args.SyncKind == string(knowledge.SyncIncremental) && syncWatermarkAt.Valid {
+		t := syncWatermarkAt.Time
+		until = &t
 	}
 
 	// 7. Set sync_status = 'syncing' (idempotent)
 	_, _ = w.pool.Exec(ctx, `UPDATE knowledge_sources SET sync_status = 'syncing', sync_error = NULL WHERE id = $1`, srcUUID)
 
 	// 8. FetchPage — error means River retries, do NOT save checkpoint
-	result, err := connector.FetchPage(ctx, args.WorkspaceID, string(configJSON), effectiveCheckpoint, since)
+	result, err := connector.FetchPage(ctx, args.WorkspaceID, string(configJSON), args.SourceID, sources.FetchOptions{
+		Cursor: effectiveCheckpoint,
+		Since:  since,
+		Until:  until,
+	})
 	if err != nil {
 		slog.Warn("sync-knowledge worker: fetch failed", "source_id", args.SourceID, "error", err)
 		return err
@@ -123,25 +134,12 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		syncGen = int(syncIndexGeneration.Int32)
 	}
 
-	// 10. Delete old points for the current generation on first batch (non-fatal)
-	if effectiveCheckpoint == "" && w.km != nil {
-		var cfg struct {
-			SpaceKey string `json:"space_key"`
-		}
-		if err := json.Unmarshal([]byte(configJSON), &cfg); err == nil && cfg.SpaceKey != "" {
-			if err := w.km.DeleteSourcePointsByGeneration(ctx, args.WorkspaceID, cfg.SpaceKey, activeIndexGeneration); err != nil {
-				slog.Warn("sync-knowledge worker: failed to delete old generation points",
-					"source_id", cfg.SpaceKey, "generation", activeIndexGeneration, "error", err)
-			}
-		}
-	}
-
-	// 11. Stamp chunks with the target sync generation
+	// 10. Stamp chunks with the target sync generation
 	for i := range result.Chunks {
 		result.Chunks[i].IndexGeneration = syncGen
 	}
 
-	// 12. Index chunks — error means River retries, do NOT save checkpoint
+	// 11. Index chunks — error means River retries, do NOT save checkpoint
 	if len(result.Chunks) > 0 && w.km != nil {
 		if err := w.km.IndexChunks(ctx, args.WorkspaceID, result.Chunks); err != nil {
 			slog.Warn("sync-knowledge worker: index failed", "source_id", args.SourceID, "error", err)
@@ -149,7 +147,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		}
 	}
 
-	// 13. Save checkpoint in transaction + optionally enqueue continuation
+	// 12. Save checkpoint in transaction + optionally enqueue continuation
 	tx, err := w.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx for checkpoint: %w", err)
@@ -199,7 +197,8 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		return nil
 	}
 
-	// 14. Last batch — finalize in transaction with generation promotion
+	// 13. Last batch — finalize in transaction with generation promotion
+	oldActiveGen := activeIndexGeneration
 	tx2, err := w.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx for finalize: %w", err)
@@ -209,7 +208,7 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 	_, err = tx2.Exec(ctx, `
 		UPDATE knowledge_sources
 		SET sync_status = 'ready', sync_error = NULL,
-		    last_synced_at = now(),
+		    last_synced_at = COALESCE(sync_watermark_at, now()),
 		    total_pages = pages_fetched,
 		    checkpoint = '',
 		    sync_run_id = NULL,
@@ -227,6 +226,16 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 
 	if err := tx2.Commit(ctx); err != nil {
 		return fmt.Errorf("commit finalize: %w", err)
+	}
+
+	// Best-effort async cleanup of old generation points after promotion
+	if w.km != nil && oldActiveGen > 0 {
+		go func(ctx context.Context, wsID, srcID string, gen int) {
+			if err := w.km.DeleteSourcePointsByGeneration(ctx, wsID, srcID, gen); err != nil {
+				slog.Warn("sync-knowledge worker: failed to cleanup old generation points",
+					"source_id", srcID, "generation", gen, "error", err)
+			}
+		}(context.Background(), args.WorkspaceID, args.SourceID, oldActiveGen)
 	}
 
 	slog.Info("sync-knowledge worker: sync complete", "source_id", args.SourceID)

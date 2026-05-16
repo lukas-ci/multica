@@ -14,8 +14,14 @@ type PageResult struct {
 	PageCount  int
 }
 
+type FetchOptions struct {
+	Cursor string
+	Since  *time.Time
+	Until  *time.Time
+}
+
 type Connector interface {
-	FetchPage(ctx context.Context, workspaceID, configJSON, cursor string, since *time.Time) (*PageResult, error)
+	FetchPage(ctx context.Context, workspaceID, configJSON, sourceID string, opts FetchOptions) (*PageResult, error)
 	SourceType() knowledge.SourceType
 }
 
