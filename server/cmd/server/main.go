@@ -348,6 +348,7 @@ func main() {
 	go runAutopilotScheduler(autopilotCtx, queries, autopilotSvc)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	go runDBStatsLogger(sweepCtx, pool)
+	go runKnowledgeSyncCleanup(sweepCtx, pool)
 
 	if workerMgr != nil {
 		workerMgr.RegisterPeriodicJobs()
