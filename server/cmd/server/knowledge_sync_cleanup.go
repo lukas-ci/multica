@@ -26,7 +26,9 @@ func runKnowledgeSyncCleanup(ctx context.Context, pool *pgxpool.Pool) {
 				    sync_error = 'sync failed after max attempts; re-sync required',
 				    sync_run_id = NULL,
 				    sync_started_at = NULL,
-				    sync_heartbeat_at = NULL
+				    sync_heartbeat_at = NULL,
+				    sync_index_generation = NULL,
+				    sync_watermark_at = NULL
 				WHERE sync_status = 'syncing'
 				AND NOT EXISTS (
 				    SELECT 1 FROM river_job
