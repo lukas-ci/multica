@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/cli"
 )
 
 func TestDeriveKnowledgeMCPURL_deriveFromServerURL(t *testing.T) {
@@ -654,6 +657,175 @@ func TestInjectKnowledgeMCP_derivedURLDisable(t *testing.T) {
 	result := d.injectKnowledgeMCP(original, "test-ws")
 	if string(result) != string(original) {
 		t.Fatalf("expected unchanged config when disabled, got %s", result)
+	}
+}
+
+// ----- Profile-scoped token tests -----
+
+// setupTestMulticaHome creates a temporary ~/.multica directory with the given
+// profile configs and returns the home dir path. Caller restores HOME in Cleanup.
+func setupTestMulticaHome(t *testing.T, defaultToken string, profileTokens map[string]string) string {
+	t.Helper()
+	home := t.TempDir()
+	multicaDir := filepath.Join(home, ".multica")
+	if err := os.MkdirAll(multicaDir, 0o755); err != nil {
+		t.Fatalf("mkdir .multica: %v", err)
+	}
+	// Write default config
+	if defaultToken != "" {
+		cfg := cli.CLIConfig{Token: defaultToken}
+		data, _ := json.Marshal(cfg)
+		if err := os.WriteFile(filepath.Join(multicaDir, "config.json"), data, 0o644); err != nil {
+			t.Fatalf("write default config: %v", err)
+		}
+	}
+	// Write profile configs
+	for name, token := range profileTokens {
+		profDir := filepath.Join(multicaDir, "profiles", name)
+		if err := os.MkdirAll(profDir, 0o755); err != nil {
+			t.Fatalf("mkdir profile %s: %v", name, err)
+		}
+		cfg := cli.CLIConfig{Token: token}
+		data, _ := json.Marshal(cfg)
+		if err := os.WriteFile(filepath.Join(profDir, "config.json"), data, 0o644); err != nil {
+			t.Fatalf("write profile config %s: %v", name, err)
+		}
+	}
+	return home
+}
+
+func TestDaemonProfileToken_defaultProfile(t *testing.T) {
+	home := setupTestMulticaHome(t, "default-token-abc", nil)
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer os.Setenv("HOME", origHome)
+
+	d := &Daemon{cfg: Config{Profile: ""}}
+	got := d.daemonProfileToken()
+	if got != "default-token-abc" {
+		t.Fatalf("expected default-token-abc, got %q", got)
+	}
+}
+
+func TestDaemonProfileToken_namedProfile(t *testing.T) {
+	home := setupTestMulticaHome(t, "default-token-abc", map[string]string{
+		"desktop-staging": "profile-token-xyz",
+	})
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer os.Setenv("HOME", origHome)
+
+	d := &Daemon{cfg: Config{Profile: "desktop-staging"}}
+	got := d.daemonProfileToken()
+	if got != "profile-token-xyz" {
+		t.Fatalf("expected profile-token-xyz, got %q", got)
+	}
+
+	// Confirm NOT falling back to default token
+	if got == "default-token-abc" {
+		t.Fatal("daemonProfileToken returned default token instead of profile-scoped token")
+	}
+}
+
+func TestDaemonProfileToken_missingFile(t *testing.T) {
+	home := t.TempDir() // no .multica at all
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer os.Setenv("HOME", origHome)
+
+	d := &Daemon{cfg: Config{Profile: "nonexistent"}}
+	got := d.daemonProfileToken()
+	if got != "" {
+		t.Fatalf("expected empty token for missing profile, got %q", got)
+	}
+}
+
+func TestDaemonProfileToken_noTokenInConfig(t *testing.T) {
+	home := setupTestMulticaHome(t, "", map[string]string{"test": ""})
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer os.Setenv("HOME", origHome)
+
+	d := &Daemon{cfg: Config{Profile: "test"}}
+	got := d.daemonProfileToken()
+	if got != "" {
+		t.Fatalf("expected empty token when profile has no token, got %q", got)
+	}
+}
+
+func TestDaemonProfileToken_defaultVsProfileIsolation(t *testing.T) {
+	// Both have different tokens — verify isolation
+	home := setupTestMulticaHome(t, "default-token", map[string]string{
+		"prod": "prod-token",
+		"stg":  "stg-token",
+	})
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer os.Setenv("HOME", origHome)
+
+	d := &Daemon{cfg: Config{Profile: "stg"}}
+	got := d.daemonProfileToken()
+	if got != "stg-token" {
+		t.Fatalf("expected stg-token, got %q", got)
+	}
+}
+
+func TestInjectKnowledgeMCP_usesProfileToken(t *testing.T) {
+	// Verify the profile-scoped token flows through to mergeKnowledgeMCP
+	// by creating a live injectKnowledgeMCP call and checking the output.
+	home := setupTestMulticaHome(t, "", map[string]string{
+		"eng2-test": "eng2-profile-token",
+	})
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", home)
+	defer os.Setenv("HOME", origHome)
+
+	var receivedToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedToken = r.Header.Get("Authorization")
+		if r.URL.Path == "/api/capabilities" {
+			w.WriteHeader(200)
+			w.Write([]byte(`{"knowledge":true}`))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		cfg: Config{
+			ServerBaseURL: srv.URL,
+			Profile:       "eng2-test",
+		},
+		logger:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	result := d.injectKnowledgeMCP(nil, "ws-1")
+	if result == nil {
+		t.Fatal("injectKnowledgeMCP returned nil")
+	}
+
+	// Token was sent in Authorization header to probe
+	if receivedToken != "Bearer eng2-profile-token" {
+		t.Fatalf("expected Bearer eng2-profile-token in probe, got %q", receivedToken)
+	}
+
+	// Token is also in the MCP config env
+	var parsed struct {
+		McpServers map[string]struct {
+			Env map[string]string `json:"env"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("result not valid JSON: %v", err)
+	}
+	ks, ok := parsed.McpServers["knowledge"]
+	if !ok {
+		t.Fatal("result missing knowledge MCP server")
+	}
+	if ks.Env["MULTICA_AUTH_TOKEN"] != "eng2-profile-token" {
+		t.Fatalf("expected MULTICA_AUTH_TOKEN=eng2-profile-token in env, got %q", ks.Env["MULTICA_AUTH_TOKEN"])
 	}
 }
 

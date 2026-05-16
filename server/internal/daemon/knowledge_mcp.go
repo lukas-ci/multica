@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/cli"
 )
 
 // knowledgeCapability represents the result of probing a backend for
@@ -203,15 +205,17 @@ func shortTokenHash(token string) string {
 
 // injectKnowledgeMCP resolves the Knowledge MCP URL, probes the backend for
 // capability, and injects the knowledge_search tool into mcpConfig when the
-// backend supports it. This is the exact composition used by runTask.
+// backend supports it. Auth uses the daemon's active profile token.
+// This is the exact composition used by runTask.
 func (d *Daemon) injectKnowledgeMCP(mcpConfig json.RawMessage, workspaceID string) json.RawMessage {
 	mcpURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL)
 	if mcpURL == "" {
 		return mcpConfig
 	}
+	token := d.daemonProfileToken()
 	switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL); cap {
 	case knowledgeCapSupported:
-		return mergeKnowledgeMCP(mcpConfig, mcpURL, workspaceID)
+		return mergeKnowledgeMCP(mcpConfig, mcpURL, token, workspaceID)
 	case knowledgeCapAuthFailure:
 		d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", mcpURL)
 	case knowledgeCapUnsupported:
@@ -222,12 +226,25 @@ func (d *Daemon) injectKnowledgeMCP(mcpConfig json.RawMessage, workspaceID strin
 	return mcpConfig
 }
 
+// daemonProfileToken returns the auth token for the daemon's active profile.
+// When the daemon has a named profile (d.cfg.Profile != ""), it reads the
+// profile-scoped config (~/.multica/profiles/<profile>/config.json). When
+// unset, it falls back to the default config (~/.multica/config.json).
+// Returns empty string when the config file is missing or has no token.
+func (d *Daemon) daemonProfileToken() string {
+	cfg, err := cli.LoadCLIConfigForProfile(d.cfg.Profile)
+	if err != nil {
+		return ""
+	}
+	return cfg.Token
+}
+
 // knowledgeMCPCapability probes the backend at serverBaseURL (the backend root,
 // e.g. "http://localhost:8080") for Knowledge MCP support, consulting and
 // updating the probe cache. Concurrent callers for the same (serverURL, token)
 // pair collapse to a single probe.
 func (d *Daemon) knowledgeMCPCapability(serverBaseURL string) knowledgeCapability {
-	token := readMulticaToken()
+	token := d.daemonProfileToken()
 	key := probeCacheKey(serverBaseURL, token)
 
 	d.knowledgeProbeMu.Lock()
@@ -270,20 +287,17 @@ func deriveKnowledgeMCPURL(serverBaseURL string) string {
 
 // mergeKnowledgeMCP merges the knowledge MCP server config into an existing
 // agent-level MCP config using the stdio transport (Cursor/Claude expected format).
-// The baseURL should come from deriveKnowledgeMCPURL so the resolution chain
-// (override env → disable env → derivation from server URL) is applied first.
-func mergeKnowledgeMCP(existing json.RawMessage, baseURL, workspaceID string) json.RawMessage {
-	// Find the script: look alongside the multica binary directory
+// The baseURL should come from deriveKnowledgeMCPURL. The token is the active
+// profile's backend auth token — never the daemon-local IPC/health token.
+func mergeKnowledgeMCP(existing json.RawMessage, baseURL, token, workspaceID string) json.RawMessage {
 	scriptPath := resolveKnowledgeScript()
 
-	// Read PAT from the daemon's Multica config for API auth
-	pat := readMulticaToken()
 	envVars := map[string]string{
 		"MULTICA_API_URL":      strings.TrimSuffix(baseURL, "/api/mcp"),
 		"MULTICA_WORKSPACE_ID": workspaceID,
 	}
-	if pat != "" {
-		envVars["MULTICA_AUTH_TOKEN"] = pat
+	if token != "" {
+		envVars["MULTICA_AUTH_TOKEN"] = token
 	}
 	ks := map[string]interface{}{
 		"command": "node",
