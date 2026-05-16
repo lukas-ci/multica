@@ -1,9 +1,12 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/crc64"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -18,9 +21,14 @@ type QdrantStore struct {
 	client      qdrantpb.PointsClient
 	collections qdrantpb.CollectionsClient
 	dimension   int
+	httpURL     string
 }
 
 func NewQdrantStore(url string, dimension int) (*QdrantStore, error) {
+	host := strings.TrimPrefix(url, "grpc://")
+	host = strings.SplitN(host, ":", 2)[0]
+	httpURL := "http://" + host + ":6333"
+
 	url = strings.TrimPrefix(url, "grpc://")
 	conn, err := grpc.Dial(url, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -30,6 +38,7 @@ func NewQdrantStore(url string, dimension int) (*QdrantStore, error) {
 		client:      qdrantpb.NewPointsClient(conn),
 		collections: qdrantpb.NewCollectionsClient(conn),
 		dimension:   dimension,
+		httpURL:     httpURL,
 	}, nil
 }
 
@@ -65,33 +74,65 @@ func (s *QdrantStore) ensureCollection(ctx context.Context, workspaceID string) 
 }
 
 func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []Chunk, vectors [][]float32) error {
+	if len(chunks) == 0 {
+		return nil
+	}
 	if err := s.ensureCollection(ctx, workspaceID); err != nil {
 		return err
 	}
-	points := make([]*qdrantpb.PointStruct, len(chunks))
+
+	// Use REST API for upsert (gRPC Upsert silently fails on Qdrant 1.18.0)
+	type restPoint struct {
+		ID      uint64         `json:"id"`
+		Vector  []float32      `json:"vector"`
+		Payload map[string]any `json:"payload"`
+	}
+	type restUpsertReq struct {
+		Points []restPoint `json:"points"`
+	}
+
+	points := make([]restPoint, len(chunks))
 	for i, c := range chunks {
-		payload := map[string]*qdrantpb.Value{
-			"text":         {Kind: &qdrantpb.Value_StringValue{StringValue: c.Text}},
-			"source_type":  {Kind: &qdrantpb.Value_StringValue{StringValue: string(c.SourceType)}},
-			"source_id":    {Kind: &qdrantpb.Value_StringValue{StringValue: c.SourceID}},
-			"workspace_id": {Kind: &qdrantpb.Value_StringValue{StringValue: c.WorkspaceID}},
-			"url":          {Kind: &qdrantpb.Value_StringValue{StringValue: c.URL}},
-			"title":        {Kind: &qdrantpb.Value_StringValue{StringValue: c.Title}},
-			"chunk_index":  {Kind: &qdrantpb.Value_IntegerValue{IntegerValue: int64(c.ChunkIndex)}},
-			"total_chunks": {Kind: &qdrantpb.Value_IntegerValue{IntegerValue: int64(c.TotalChunks)}},
-			"synced_at":    {Kind: &qdrantpb.Value_StringValue{StringValue: time.Now().UTC().Format(time.RFC3339)}},
+		payload := map[string]any{
+			"text":         c.Text,
+			"source_type":  string(c.SourceType),
+			"source_id":    c.SourceID,
+			"workspace_id": c.WorkspaceID,
+			"url":          c.URL,
+			"title":        c.Title,
+			"chunk_index":  c.ChunkIndex,
+			"total_chunks": c.TotalChunks,
+			"synced_at":    time.Now().UTC().Format(time.RFC3339),
 		}
-		points[i] = &qdrantpb.PointStruct{
-			Id:      &qdrantpb.PointId{PointIdOptions: &qdrantpb.PointId_Num{Num: stablePointID(c.SourceID, c.PageID, c.ChunkIndex)}},
-			Vectors: &qdrantpb.Vectors{VectorsOptions: &qdrantpb.Vectors_Vector{Vector: &qdrantpb.Vector{Data: vectors[i]}}},
+		points[i] = restPoint{
+			ID:      stablePointID(c.SourceID, c.PageID, c.ChunkIndex),
+			Vector:  vectors[i],
 			Payload: payload,
 		}
 	}
-	_, err := s.client.Upsert(ctx, &qdrantpb.UpsertPoints{
-		CollectionName: collectionName(workspaceID),
-		Points:         points,
-	})
-	return err
+
+	reqBody, err := json.Marshal(restUpsertReq{Points: points})
+	if err != nil {
+		return fmt.Errorf("qdrant upsert marshal: %w", err)
+	}
+
+	reqURL := fmt.Sprintf("%s/collections/%s/points?wait=true", s.httpURL, collectionName(workspaceID))
+	req, err := http.NewRequestWithContext(ctx, "PUT", reqURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("qdrant upsert request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("qdrant upsert: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("qdrant upsert: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (s *QdrantStore) CountPoints(ctx context.Context, workspaceID string) (uint64, error) {
