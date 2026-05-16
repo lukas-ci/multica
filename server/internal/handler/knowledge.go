@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/knowledge"
 	"github.com/multica-ai/multica/server/internal/logger"
 )
@@ -160,6 +162,29 @@ func (h *Handler) CreateKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, map[string]string{"id": sourceID})
 }
 
+func (h *Handler) acquireLock(ctx context.Context, sourceID string) (*pgxpool.Conn, error) {
+	pool, ok := h.TxStarter.(*pgxpool.Pool)
+	if !ok {
+		return nil, fmt.Errorf("TxStarter is not a *pgxpool.Pool")
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lockKey := hashSourceID(sourceID)
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
+		conn.Release()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (h *Handler) releaseLock(conn *pgxpool.Conn, sourceID string) {
+	lockKey := hashSourceID(sourceID)
+	conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", lockKey)
+	conn.Release()
+}
+
 func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 	sourceID := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
@@ -177,41 +202,63 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Use explicit transaction with advisory lock spanning all DB operations
-	tx, err := h.TxStarter.Begin(r.Context())
+	// Acquire session-level advisory lock (pinned connection, not xact-bound)
+	conn, err := h.acquireLock(r.Context(), sourceID)
 	if err != nil {
-		slog.Warn("DeleteKnowledgeSource: begin tx failed", append(logger.RequestAttrs(r), "error", err)...)
+		slog.Warn("DeleteKnowledgeSource: acquire lock failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to acquire lock")
 		return
 	}
-	defer tx.Rollback(r.Context())
+	defer h.releaseLock(conn, sourceID)
 
-	lockKey := hashSourceID(sourceID)
-	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
-		slog.Warn("DeleteKnowledgeSource: advisory lock failed", append(logger.RequestAttrs(r), "error", err)...)
-		writeError(w, http.StatusInternalServerError, "failed to acquire lock")
-		return
-	}
-
-	// Load source row with config and active generation
+	// Short tx: load config + generation, then delete the row
 	var configJSON json.RawMessage
 	var activeIndexGeneration int
-	var syncRunID pgtype.UUID
+	tx, err := conn.Begin(r.Context())
+	if err != nil {
+		slog.Warn("DeleteKnowledgeSource: begin tx failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
+		return
+	}
+
 	err = tx.QueryRow(r.Context(), `
-		SELECT config, active_index_generation, sync_run_id
+		SELECT config, active_index_generation
 		FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
-	`, srcUUID, wsUUID).Scan(&configJSON, &activeIndexGeneration, &syncRunID)
+	`, srcUUID, wsUUID).Scan(&configJSON, &activeIndexGeneration)
 	if err != nil {
 		if isNotFound(err) {
+			tx.Rollback(r.Context())
 			writeError(w, http.StatusNotFound, "knowledge source not found")
 			return
 		}
+		tx.Rollback(r.Context())
 		slog.Warn("DeleteKnowledgeSource lookup failed", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to read knowledge source")
 		return
 	}
 
-	// Delete Qdrant points by canonical UUID (new-format points)
+	result, err := tx.Exec(r.Context(), `
+		DELETE FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
+	`, srcUUID, wsUUID)
+	if err != nil {
+		tx.Rollback(r.Context())
+		slog.Warn("DeleteKnowledgeSource delete failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
+		return
+	}
+	if result.RowsAffected() == 0 {
+		tx.Rollback(r.Context())
+		writeError(w, http.StatusNotFound, "knowledge source not found")
+		return
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Warn("DeleteKnowledgeSource: commit failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
+		return
+	}
+
+	// Qdrant cleanup (outside tx, still under session lock — best-effort)
 	if h.KnowledgeManager != nil {
 		if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, sourceID, activeIndexGeneration); err != nil {
 			slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration canonical failed",
@@ -219,7 +266,6 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Parse config to extract space_key for legacy Qdrant points
 	var cfg struct {
 		SpaceKey string `json:"space_key"`
 	}
@@ -230,26 +276,6 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 					"workspace_id", workspaceID, "source_id", cfg.SpaceKey, "generation", activeIndexGeneration, "error", err)
 			}
 		}
-	}
-
-	// Delete DB row within the protected transaction
-	result, err := tx.Exec(r.Context(), `
-		DELETE FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
-	`, srcUUID, wsUUID)
-	if err != nil {
-		slog.Warn("DeleteKnowledgeSource failed", append(logger.RequestAttrs(r), "error", err)...)
-		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
-		return
-	}
-	if result.RowsAffected() == 0 {
-		writeError(w, http.StatusNotFound, "knowledge source not found")
-		return
-	}
-
-	if err := tx.Commit(r.Context()); err != nil {
-		slog.Warn("DeleteKnowledgeSource: commit failed", append(logger.RequestAttrs(r), "error", err)...)
-		writeError(w, http.StatusInternalServerError, "failed to delete knowledge source")
-		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
