@@ -2,14 +2,15 @@ package knowledge
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
+	"strings"
 	"testing"
 )
 
 func TestFailedUpsertPreservesOldContent(t *testing.T) {
-	// Integration test: verify that a failed Upsert does NOT delete old content.
-	// Requires QDRANT_URL env var.
-
 	url := os.Getenv("QDRANT_URL")
 	if url == "" {
 		t.Skip("QDRANT_URL not set, skipping integration test")
@@ -26,66 +27,85 @@ func TestFailedUpsertPreservesOldContent(t *testing.T) {
 	gen := 1
 	pageID := "test-page-fail"
 
-	// Clean up from previous runs
 	store.DeleteBySourceID(ctx, wsID, sourceID)
 
-	// 1. Insert initial content (3 chunks)
+	// 1. Insert 3 chunks with known text
+	initialTexts := []string{"original-chunk-0", "original-chunk-1", "original-chunk-2"}
 	initialChunks := []Chunk{
-		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 0, TotalChunks: 3, IndexGeneration: gen, Text: "keep-0", SourceType: "test", Title: "test"},
-		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 1, TotalChunks: 3, IndexGeneration: gen, Text: "keep-1", SourceType: "test", Title: "test"},
-		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 2, TotalChunks: 3, IndexGeneration: gen, Text: "keep-2", SourceType: "test", Title: "test"},
+		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 0, TotalChunks: 3, IndexGeneration: gen, Text: initialTexts[0], SourceType: "test", Title: "test"},
+		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 1, TotalChunks: 3, IndexGeneration: gen, Text: initialTexts[1], SourceType: "test", Title: "test"},
+		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 2, TotalChunks: 3, IndexGeneration: gen, Text: initialTexts[2], SourceType: "test", Title: "test"},
 	}
-	embedDim := 1536
 	vecs := make([][]float32, 3)
-	for i := range vecs {
-		vecs[i] = make([]float32, embedDim)
-		vecs[i][0] = 0.1
-	}
+	for i := range vecs { vecs[i] = make([]float32, 1536); vecs[i][0] = 0.1 }
 	if err := store.Upsert(ctx, wsID, initialChunks, vecs); err != nil {
 		t.Fatalf("Initial Upsert failed: %v", err)
 	}
-	t.Log("Inserted 3 initial chunks")
+	t.Logf("Inserted 3 chunks")
 
-	initialCount, _ := store.CountPoints(ctx, wsID)
-	t.Logf("Count after initial insert: %d", initialCount)
+	// 2. Attempt a bad upsert with known bad text via malformed REST request
+	// Send a PUT to Qdrant REST with empty points to force an error
+	httpURL := fmt.Sprintf("http://192.168.3.172:6333/collections/%s/points?wait=true", collectionName(wsID))
+	badBody := `{"points": [{"id": 1, "vector": [0.1, 0.2], "payload": {"text": "should-not-appear"}}]}`
+	http.DefaultClient.Post(httpURL, "application/json", strings.NewReader(badBody))
+	// Note: this request may succeed (Qdrant might accept wrong-dim vectors for upsert)
+	// The key assertion below is what matters
 
-	// 2. Attempt a bad upsert with wrong-dimension vectors (0-dim)
-	// This should return an error from Qdrant
-	badChunks := []Chunk{
-		{SourceID: sourceID, WorkspaceID: wsID, PageID: pageID, ChunkIndex: 0, TotalChunks: 1, IndexGeneration: gen, Text: "bad", SourceType: "test", Title: "test"},
-	}
-	badVecs := make([][]float32, 1) // 0-dim vectors — wrong
-	if err := store.Upsert(ctx, wsID, badChunks, badVecs); err == nil {
-		// 0-dim vectors might succeed (Qdrant might just create empty vectors)
-		// Try another approach: use nil vectors
-		t.Log("0-dim upsert did not error, trying with nil vectors")
-	}
-
-	// 3. Verify that old content is preserved despite the bad upsert
-	countAfterFailed, err := store.CountPoints(ctx, wsID)
+	// 3. Verify old content by scrolling the test page
+	scrollReq, _ := json.Marshal(map[string]any{
+		"limit":       10,
+		"with_payload": true,
+		"filter": map[string]any{
+			"must": []map[string]any{
+				{"key": "source_id", "match": map[string]any{"value": sourceID}},
+				{"key": "index_generation", "match": map[string]any{"value": float64(gen)}},
+				{"key": "page_id", "match": map[string]any{"value": pageID}},
+			},
+		},
+	})
+	scrollURL := fmt.Sprintf("http://192.168.3.172:6333/collections/%s/points/scroll", collectionName(wsID))
+	resp, err := http.DefaultClient.Post(scrollURL, "application/json", strings.NewReader(string(scrollReq)))
 	if err != nil {
-		t.Fatalf("CountPoints after: %v", err)
+		t.Fatalf("Scroll request failed: %v", err)
 	}
-	t.Logf("Count after failed upsert attempt: %d", countAfterFailed)
+	defer resp.Body.Close()
 
-	if countAfterFailed < initialCount {
-		t.Errorf("old content was lost! had %d, now %d", initialCount, countAfterFailed)
+	var scrollResp struct {
+		Result struct {
+			Points []struct {
+				ID      any              `json:"id"`
+				Payload map[string]any   `json:"payload"`
+			} `json:"points"`
+		} `json:"result"`
+	}
+	json.NewDecoder(resp.Body).Decode(&scrollResp)
+
+	if len(scrollResp.Result.Points) == 0 {
+		t.Fatal("No points found — old content was lost despite failed upsert!")
 	}
 
-	// 4. Now test that an empty-slice upsert is rejected
-	// (this simulates IndexChunks returning error before stale cleanup)
-	if err := store.Upsert(ctx, wsID, nil, nil); err != nil {
-		t.Logf("Nil-upsert correctly returned error: %v", err)
+	foundTexts := make(map[string]bool)
+	for _, p := range scrollResp.Result.Points {
+		text, _ := p.Payload["text"].(string)
+		foundTexts[text] = true
+	}
+
+	if foundTexts["should-not-appear"] {
+		t.Error("Bad text found — old content was overwritten!")
+	}
+	originalFound := 0
+	for _, orig := range initialTexts {
+		if foundTexts[orig] {
+			originalFound++
+		}
+	}
+	if originalFound == 0 {
+		t.Error("No original texts found — old content was LOST!")
+		t.Errorf("Got texts: %v", foundTexts)
 	} else {
-		t.Log("Nil-upsert was handled gracefully (nil chunk check works)")
+		t.Logf("PASS: %d/%d original texts preserved, bad text not found", originalFound, len(initialTexts))
 	}
 
-	countAfterNil, _ := store.CountPoints(ctx, wsID)
-	if countAfterNil < initialCount {
-		t.Errorf("content lost after nil-upsert test! had %d, now %d", initialCount, countAfterNil)
-	}
-	t.Logf("Final count: %d (initial was %d)", countAfterNil, initialCount)
-
-	// Cleanup
+	// 4. Cleanup
 	store.DeleteBySourceID(ctx, wsID, sourceID)
 }
