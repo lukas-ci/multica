@@ -2,12 +2,15 @@ package handler
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/knowledge"
 	"github.com/multica-ai/multica/server/internal/logger"
@@ -166,11 +169,22 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Get space key from config before deleting the row
+	// Acquire advisory lock for this source
+	lockKey := hashSourceID(sourceID)
+	if _, err := h.DB.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		slog.Warn("DeleteKnowledgeSource: advisory lock failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to acquire lock")
+		return
+	}
+
+	// Load source row with config and active generation
 	var configJSON json.RawMessage
+	var activeIndexGeneration int
+	var syncRunID pgtype.UUID
 	err := h.DB.QueryRow(r.Context(), `
-		SELECT config FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
-	`, srcUUID, wsUUID).Scan(&configJSON)
+		SELECT config, active_index_generation, sync_run_id
+		FROM knowledge_sources WHERE id = $1 AND workspace_id = $2
+	`, srcUUID, wsUUID).Scan(&configJSON, &activeIndexGeneration, &syncRunID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "knowledge source not found")
@@ -204,10 +218,16 @@ func (h *Handler) DeleteKnowledgeSource(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Delete Qdrant points for this source
+	// Delete Qdrant points for this source — generation-specific then catch-all
 	if h.KnowledgeManager != nil && sourceIDInQdrant != "" {
+		if err := h.KnowledgeManager.DeleteSourcePointsByGeneration(r.Context(), workspaceID, sourceIDInQdrant, activeIndexGeneration); err != nil {
+			slog.Warn("DeleteKnowledgeSource: DeleteSourcePointsByGeneration failed",
+				"workspace_id", workspaceID, "source_id", sourceIDInQdrant, "generation", activeIndexGeneration, "error", err)
+		}
+		// Catch-all: delete any remaining points from earlier generations
 		if err := h.KnowledgeManager.DeleteSourcePoints(r.Context(), workspaceID, sourceIDInQdrant); err != nil {
-			slog.Warn("DeleteKnowledgeSource: DeleteSourcePoints failed", "workspace_id", workspaceID, "source_id", sourceIDInQdrant, "error", err)
+			slog.Warn("DeleteKnowledgeSource: DeleteSourcePoints catch-all failed",
+				"workspace_id", workspaceID, "source_id", sourceIDInQdrant, "error", err)
 		}
 	}
 
@@ -261,24 +281,37 @@ func (h *Handler) SyncKnowledgeSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enqueue first, reset on success (avoids orphaned state if enqueue fails)
-	if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
-		SourceID:    sourceID,
-		WorkspaceID: workspaceID,
-		SyncKind:    string(knowledge.SyncFull),
-	}); err != nil {
-		slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
+	// Acquire advisory lock for this source to prevent concurrent sync/delete
+	lockKey := hashSourceID(sourceID)
+	if _, err := h.DB.Exec(r.Context(), `SELECT pg_advisory_xact_lock($1)`, lockKey); err != nil {
+		slog.Warn("SyncKnowledgeSource: advisory lock failed", append(logger.RequestAttrs(r), "error", err)...)
+		writeError(w, http.StatusInternalServerError, "failed to acquire sync lock")
+		return
+	}
+
+	// Create a new sync run (reset state + bump generation + set run ID)
+	syncRunID := uuid.NewString()
+	if _, err := h.DB.Exec(r.Context(), `
+		UPDATE knowledge_sources
+		SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full',
+		    sync_run_id = $1, sync_started_at = now(), sync_heartbeat_at = now(),
+		    sync_index_generation = active_index_generation + 1
+		WHERE id = $2
+	`, syncRunID, srcUUID); err != nil {
+		slog.Warn("SyncKnowledgeSource: failed to initialize sync run", append(logger.RequestAttrs(r), "error", err)...)
 		writeError(w, http.StatusInternalServerError, "failed to start sync")
 		return
 	}
 
-	_, err = h.DB.Exec(r.Context(), `
-		UPDATE knowledge_sources
-		SET checkpoint = '', pages_fetched = 0, total_pages = NULL, sync_kind = 'full'
-		WHERE id = $1
-	`, srcUUID)
-	if err != nil {
-		slog.Warn("SyncKnowledgeSource: failed to reset sync state", append(logger.RequestAttrs(r), "error", err)...)
+	if err := h.WorkerManager.Enqueue(context.Background(), worker.SyncKnowledgeArgs{
+		SourceID:    sourceID,
+		WorkspaceID: workspaceID,
+		SyncKind:    string(knowledge.SyncFull),
+		SyncRunID:   syncRunID,
+	}); err != nil {
+		slog.Warn("SyncKnowledgeSource: failed to enqueue sync job", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to start sync")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "syncing"})
@@ -311,6 +344,27 @@ func (h *Handler) SearchKnowledge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build generation filter from ready non-legacy sources
+	genRows, err := h.DB.Query(r.Context(), `
+		SELECT id, active_index_generation, legacy_index_mode
+		FROM knowledge_sources
+		WHERE workspace_id = $1 AND sync_status = 'ready'
+	`, parseUUID(workspaceID))
+	if err == nil {
+		defer genRows.Close()
+		for genRows.Next() {
+			var id pgtype.UUID
+			var gen int
+			var legacy bool
+			if err := genRows.Scan(&id, &gen, &legacy); err == nil && !legacy && id.Valid {
+				if req.IndexGenerations == nil {
+					req.IndexGenerations = make(map[string]int)
+				}
+				req.IndexGenerations[uuidToString(id)] = gen
+			}
+		}
+	}
+
 	results, err := h.KnowledgeManager.Search(r.Context(), req)
 	if err != nil {
 		slog.Warn("KnowledgeManager.Search failed", append(logger.RequestAttrs(r), "error", err)...)
@@ -330,6 +384,13 @@ func knowledgeIndexHealthStatus(readySourceCount int, indexedPointCount uint64, 
 	return knowledgeIndexHealth{Unhealthy: true, ErrorMessage: knowledgeEmptyIndexError}
 }
 
+func hashSourceID(id string) int64 {
+	h := sha1.New()
+	h.Write([]byte(id))
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
 func (h *Handler) reconcileReadyKnowledgeIndex(ctx context.Context, workspaceID string) knowledgeIndexHealth {
 	if h.KnowledgeManager == nil || workspaceID == "" {
 		return knowledgeIndexHealth{}
@@ -337,7 +398,7 @@ func (h *Handler) reconcileReadyKnowledgeIndex(ctx context.Context, workspaceID 
 	var readyCount int
 	if err := h.DB.QueryRow(ctx, `
 		SELECT count(*) FROM knowledge_sources
-		WHERE workspace_id = $1 AND sync_status = 'ready'
+		WHERE workspace_id = $1 AND sync_status = 'ready' AND legacy_index_mode = false
 	`, parseUUID(workspaceID)).Scan(&readyCount); err != nil {
 		slog.Warn("knowledge ready health query failed", "workspace_id", workspaceID, "error", err)
 		return knowledgeIndexHealth{}

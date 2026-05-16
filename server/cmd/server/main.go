@@ -353,9 +353,15 @@ func main() {
 		workerMgr.RegisterPeriodicJobs()
 
 		if _, err := pool.Exec(context.Background(), `
-			UPDATE knowledge_sources
+			UPDATE knowledge_sources ks
 			SET sync_status = 'error', sync_error = 'server restarted mid-sync, re-sync required'
 			WHERE sync_status = 'syncing'
+			AND NOT EXISTS (
+			    SELECT 1 FROM river_job
+			    WHERE kind = 'sync_knowledge'
+			    AND args->>'source_id' = ks.id::text
+			    AND state IN ('available', 'running', 'retryable', 'scheduled')
+			)
 		`); err != nil {
 			slog.Warn("startup: failed to recover stuck knowledge sources", "error", err)
 		} else {
