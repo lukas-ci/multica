@@ -168,27 +168,27 @@ func (w *SyncKnowledgeWorker) Work(ctx context.Context, job *river.Job[SyncKnowl
 		result.Chunks[i].IndexGeneration = syncGen
 	}
 
-	// 9. For incremental: delete each page's existing points in active gen before re-indexing
-	// Handles shrunk pages (orphan chunks) and retry idempotency
-	if args.SyncKind == string(knowledge.SyncIncremental) && w.km != nil && len(result.Chunks) > 0 {
-		pageIDs := make(map[string]struct{})
-		for _, c := range result.Chunks {
-			if c.PageID != "" {
-				pageIDs[c.PageID] = struct{}{}
-			}
-		}
-		for pageID := range pageIDs {
-			if err := w.km.DeletePointsByPageID(ctx, args.WorkspaceID, args.SourceID, syncGen, pageID); err != nil {
-				slog.Warn("sync-knowledge: failed to clear page", "page_id", pageID, "error", err)
-			}
-		}
-	}
-
-	// 10. Index chunks — error means River retries
+	// 9. Index chunks — error means River retries
 	if len(result.Chunks) > 0 && w.km != nil {
 		if err := w.km.IndexChunks(ctx, args.WorkspaceID, result.Chunks); err != nil {
 			slog.Warn("sync-knowledge worker: index failed", "source_id", args.SourceID, "error", err)
 			return err
+		}
+	}
+
+	// 10. For incremental: after upsert, delete stale extra chunks (from shrunk pages)
+	if args.SyncKind == string(knowledge.SyncIncremental) && w.km != nil && len(result.Chunks) > 0 {
+		pageTotals := make(map[string]int)
+		for _, c := range result.Chunks {
+			if c.PageID != "" && c.TotalChunks > pageTotals[c.PageID] {
+				pageTotals[c.PageID] = c.TotalChunks
+			}
+		}
+		gen := result.Chunks[0].IndexGeneration
+		for pageID, total := range pageTotals {
+			if err := w.km.DeleteStalePageChunks(ctx, args.WorkspaceID, args.SourceID, gen, pageID, total); err != nil {
+				slog.Warn("sync-knowledge: stale cleanup failed", "page_id", pageID, "error", err)
+			}
 		}
 	}
 

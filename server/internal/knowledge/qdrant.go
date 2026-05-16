@@ -338,6 +338,26 @@ func (s *QdrantStore) DeletePointsByPageID(ctx context.Context, workspaceID, sou
 	})
 }
 
+func (s *QdrantStore) DeleteStalePageChunks(ctx context.Context, workspaceID, sourceID string, generation int, pageID string, keepChunkCount int) error {
+	return s.deleteByFilter(ctx, workspaceID, map[string]any{
+		"must": []map[string]any{
+			{"key": "source_id", "match": map[string]any{"value": sourceID}},
+			{"key": "index_generation", "match": map[string]any{"value": float64(generation)}},
+			{"key": "page_id", "match": map[string]any{"value": pageID}},
+			{"key": "chunk_index", "range": map[string]any{"gte": float64(keepChunkCount)}},
+		},
+	})
+}
+
+func (s *QdrantStore) DeleteBySourceIDAndType(ctx context.Context, workspaceID, sourceID, sourceType string) error {
+	return s.deleteByFilter(ctx, workspaceID, map[string]any{
+		"must": []map[string]any{
+			{"key": "source_id", "match": map[string]any{"value": sourceID}},
+			{"key": "source_type", "match": map[string]any{"value": sourceType}},
+		},
+	})
+}
+
 func (s *QdrantStore) DeleteAllBySourceID(ctx context.Context, workspaceID, sourceID string) error {
 	return s.deleteByFilter(ctx, workspaceID, map[string]any{
 		"must": []map[string]any{

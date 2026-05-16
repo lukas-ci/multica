@@ -44,6 +44,14 @@ func (m *Manager) DeletePointsByPageID(ctx context.Context, workspaceID, sourceI
 	return m.store.DeletePointsByPageID(ctx, workspaceID, sourceID, generation, pageID)
 }
 
+func (m *Manager) DeleteStalePageChunks(ctx context.Context, workspaceID, sourceID string, generation int, pageID string, keepChunkCount int) error {
+	return m.store.DeleteStalePageChunks(ctx, workspaceID, sourceID, generation, pageID, keepChunkCount)
+}
+
+func (m *Manager) DeleteBySourceIDAndType(ctx context.Context, workspaceID, sourceID, sourceType string) error {
+	return m.store.DeleteBySourceIDAndType(ctx, workspaceID, sourceID, sourceType)
+}
+
 func (m *Manager) DeleteAllSourcePoints(ctx context.Context, workspaceID, sourceID string) error {
 	return m.store.DeleteAllBySourceID(ctx, workspaceID, sourceID)
 }
