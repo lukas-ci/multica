@@ -372,6 +372,121 @@ func TestContainsKnowledgeSearch(t *testing.T) {
 	}
 }
 
+// Wiring-level test: prove that knowledgeMCPCapability with a configured
+// server root URL probes /api/capabilities and /api/mcp correctly (not
+// /api/mcp/api/capabilities), then returns supported when the backend
+// advertises knowledge_search.
+func TestKnowledgeMCPCapability_wiring(t *testing.T) {
+	var capabilitiesCalls atomic.Int32
+	var mcpCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/capabilities":
+			capabilitiesCalls.Add(1)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"knowledge":true}`))
+		case "/api/mcp":
+			mcpCalls.Add(1)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"result":{"tools":[{"name":"knowledge_search","description":"search"}]}}`))
+		default:
+			t.Logf("unexpected request path: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+	d.cfg.ServerBaseURL = srv.URL
+
+	// First call: probe, cache miss
+	cap := d.knowledgeMCPCapability(srv.URL)
+	if cap != knowledgeCapSupported {
+		t.Fatalf("first call: expected supported, got %v", cap)
+	}
+	if capabilitiesCalls.Load() != 1 {
+		t.Fatalf("expected 1 /api/capabilities call, got %d", capabilitiesCalls.Load())
+	}
+	if mcpCalls.Load() != 0 {
+		t.Fatalf("expected 0 /api/mcp calls (capabilities 200 shortcut), got %d", mcpCalls.Load())
+	}
+
+	// Second call: should use cache, no new requests
+	cap = d.knowledgeMCPCapability(srv.URL)
+	if cap != knowledgeCapSupported {
+		t.Fatalf("second call (cached): expected supported, got %v", cap)
+	}
+	if capabilitiesCalls.Load() != 1 {
+		t.Fatalf("expected still 1 /api/capabilities call (cached), got %d", capabilitiesCalls.Load())
+	}
+}
+
+// Wiring test: capabilities 404 → falls through to /api/mcp, result = supported.
+func TestKnowledgeMCPCapability_wiring_fallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/capabilities":
+			w.WriteHeader(404)
+		case "/api/mcp":
+			w.WriteHeader(200)
+			w.Write([]byte(`{"result":{"tools":[{"name":"knowledge_search","description":"search"}]}}`))
+		default:
+			t.Logf("unexpected: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	cap := d.knowledgeMCPCapability(srv.URL)
+	if cap != knowledgeCapSupported {
+		t.Fatalf("expected supported via /api/mcp fallback, got %v", cap)
+	}
+}
+
+// Wiring test: unsupported backend (MCP returns 404) → unsupported result.
+func TestKnowledgeMCPCapability_wiring_unsupported(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/capabilities":
+			w.WriteHeader(404)
+		case "/api/mcp":
+			w.WriteHeader(404)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	d := &Daemon{
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	cap := d.knowledgeMCPCapability(srv.URL)
+	if cap != knowledgeCapUnsupported {
+		t.Fatalf("expected unsupported, got %v", cap)
+	}
+}
+
+// Wiring test: backend unreachable → transient.
+func TestKnowledgeMCPCapability_wiring_transient(t *testing.T) {
+	d := &Daemon{
+		knowledgeProbeCache: newKnowledgeProbeCache(),
+	}
+
+	// Point at a port that will refuse/not connect
+	cap := d.knowledgeMCPCapability("http://127.0.0.1:1")
+	if cap != knowledgeCapTransient {
+		t.Fatalf("expected transient, got %v", cap)
+	}
+}
+
 func TestDeriveKnowledgeMCPURL_trailingSlash(t *testing.T) {
 	os.Unsetenv("MULTICA_KNOWLEDGE_MCP_URL")
 	os.Unsetenv("MULTICA_KNOWLEDGE_MCP_DISABLE")

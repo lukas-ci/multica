@@ -2147,17 +2147,19 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// backend has the knowledge service enabled. Merges into any
 	// existing agent-level MCP config so agents always discover it.
 	// URL resolution: override env → disable env → derivation from server URL.
-	// After resolving the URL, probe the backend for capability before injecting.
-	if baseURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL); baseURL != "" {
-		switch cap := d.knowledgeMCPCapability(baseURL); cap {
+	// The probe always targets d.cfg.ServerBaseURL (backend root), not the
+	// derived MCP endpoint, so it hits /api/capabilities or /api/mcp correctly.
+	// A non-empty mcpURL means Knowledge MCP is not disabled by the user.
+	if mcpURL := deriveKnowledgeMCPURL(d.cfg.ServerBaseURL); mcpURL != "" {
+		switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL); cap {
 		case knowledgeCapSupported:
-			mcpConfig = mergeKnowledgeMCP(mcpConfig, baseURL, task.WorkspaceID)
+			mcpConfig = mergeKnowledgeMCP(mcpConfig, mcpURL, task.WorkspaceID)
 		case knowledgeCapAuthFailure:
-			d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", baseURL)
+			d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", mcpURL)
 		case knowledgeCapUnsupported:
-			d.logger.Info("knowledge MCP disabled: backend does not support knowledge service", "url", baseURL)
+			d.logger.Info("knowledge MCP disabled: backend does not support knowledge service", "url", mcpURL)
 		case knowledgeCapTransient:
-			d.logger.Warn("knowledge MCP disabled: backend unreachable", "url", baseURL)
+			d.logger.Warn("knowledge MCP disabled: backend unreachable", "url", mcpURL)
 		}
 	}
 	// Two-tier model resolution: an explicit agent.model wins,

@@ -201,12 +201,13 @@ func shortTokenHash(token string) string {
 	return fmt.Sprintf("%x", h[:4])
 }
 
-// knowledgeMCPCapability returns the backend's Knowledge MCP capability,
-// consulting and updating the probe cache. Concurrent callers for the same
-// (serverURL, token) pair collapse to a single probe.
-func (d *Daemon) knowledgeMCPCapability(baseURL string) knowledgeCapability {
+// knowledgeMCPCapability probes the backend at serverBaseURL (the backend root,
+// e.g. "http://localhost:8080") for Knowledge MCP support, consulting and
+// updating the probe cache. Concurrent callers for the same (serverURL, token)
+// pair collapse to a single probe.
+func (d *Daemon) knowledgeMCPCapability(serverBaseURL string) knowledgeCapability {
 	token := readMulticaToken()
-	key := probeCacheKey(baseURL, token)
+	key := probeCacheKey(serverBaseURL, token)
 
 	d.knowledgeProbeMu.Lock()
 	if cap, ok := d.knowledgeProbeCache.get(key); ok {
@@ -216,7 +217,7 @@ func (d *Daemon) knowledgeMCPCapability(baseURL string) knowledgeCapability {
 	// Not cached — probe under the lock so concurrent callers for the same
 	// key do not stampede the backend.
 	client := &http.Client{Timeout: 10 * time.Second}
-	cap := probeKnowledgeMCPCap(client, baseURL, token)
+	cap := probeKnowledgeMCPCap(client, serverBaseURL, token)
 	d.knowledgeProbeCache.set(key, cap)
 	d.knowledgeProbeMu.Unlock()
 	return cap
