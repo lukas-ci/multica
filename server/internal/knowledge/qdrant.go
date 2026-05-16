@@ -98,6 +98,7 @@ func (s *QdrantStore) Upsert(ctx context.Context, workspaceID string, chunks []C
 			"source_type":       string(c.SourceType),
 			"source_id":         c.SourceID,
 			"workspace_id":      c.WorkspaceID,
+			"page_id":           c.PageID,
 			"url":               c.URL,
 			"title":             c.Title,
 			"chunk_index":       c.ChunkIndex,
