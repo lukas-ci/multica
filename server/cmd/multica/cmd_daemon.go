@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -112,6 +113,50 @@ func init() {
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonLogsCmd)
 	daemonCmd.AddCommand(daemonDiskUsageCmd)
+	daemonCmd.AddCommand(daemonKnowledgeMCPCmd)
+}
+
+// daemonKnowledgeMCPCmd implements a stdio MCP proxy for the Knowledge tool.
+// It reads JSON-RPC requests from stdin, proxies them to the backend /api/mcp,
+// and writes the responses to stdout. This replaces the previous Node.js wrapper
+// so Knowledge MCP works without system Node or a developer checkout.
+var daemonKnowledgeMCPCmd = &cobra.Command{
+	Use:   "mcp-knowledge",
+	Short: "Knowledge MCP stdio proxy (internal)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		apiURL := os.Getenv("MULTICA_API_URL")
+		authToken := os.Getenv("MULTICA_AUTH_TOKEN")
+		workspaceID := os.Getenv("MULTICA_WORKSPACE_ID")
+
+		if apiURL == "" {
+			return fmt.Errorf("MULTICA_API_URL not set")
+		}
+
+		mcpURL := strings.TrimRight(apiURL, "/") + "/api/mcp"
+		client := &http.Client{Timeout: 60 * time.Second}
+
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+
+			resp, err := daemon.ProxyMCPRequest(client, mcpURL, authToken, workspaceID, line)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "mcp-knowledge proxy error: %v\n", err)
+				// Return a JSON-RPC error response to the agent
+				errorResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"proxy error: %s"}}`, err.Error())
+				os.Stdout.WriteString(errorResp + "\n")
+				continue
+			}
+
+			os.Stdout.Write(resp)
+			os.Stdout.WriteString("\n")
+		}
+
+		return scanner.Err()
+	},
 }
 
 // daemonDirForProfile returns the state directory for the given profile.

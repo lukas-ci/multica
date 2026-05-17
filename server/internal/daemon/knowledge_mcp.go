@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -289,9 +290,10 @@ func deriveKnowledgeMCPURL(serverBaseURL string) string {
 // agent-level MCP config using the stdio transport (Cursor/Claude expected format).
 // The baseURL should come from deriveKnowledgeMCPURL. The token is the active
 // profile's backend auth token — never the daemon-local IPC/health token.
+//
+// The MCP wrapper is the multica binary itself (daemon mcp-knowledge subcommand),
+// so Knowledge MCP works without system Node or a developer checkout.
 func mergeKnowledgeMCP(existing json.RawMessage, baseURL, token, workspaceID string) json.RawMessage {
-	scriptPath := resolveKnowledgeScript()
-
 	envVars := map[string]string{
 		"MULTICA_API_URL":      strings.TrimSuffix(baseURL, "/api/mcp"),
 		"MULTICA_WORKSPACE_ID": workspaceID,
@@ -300,8 +302,8 @@ func mergeKnowledgeMCP(existing json.RawMessage, baseURL, token, workspaceID str
 		envVars["MULTICA_AUTH_TOKEN"] = token
 	}
 	ks := map[string]interface{}{
-		"command": "node",
-		"args":    []string{scriptPath},
+		"command": multicaBinaryPath(),
+		"args":    []string{"daemon", "mcp-knowledge"},
 		"env":     envVars,
 	}
 
@@ -344,16 +346,60 @@ func readMulticaToken() string {
 }
 
 func resolveKnowledgeScript() string {
-	// Look in the same directory as the multica binary, then in ~/dev
+	// DEPRECATED: kept for backward compat with older Node-based wrapper.
+	// Production uses multicaBinaryPath() + ["daemon", "mcp-knowledge"].
 	paths := []string{
 		filepath.Join(filepath.Dir(os.Args[0]), "tools", "mcp-knowledge", "index.mjs"),
-		filepath.Join(os.Getenv("HOME"), "dev", "multica-source", "tools", "mcp-knowledge", "index.mjs"),
 	}
 	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	// Fallback: relative to the cloned source
-	return filepath.Join(os.Getenv("HOME"), "dev", "multica-source", "tools", "mcp-knowledge", "index.mjs")
+	return ""
+}
+
+// multicaBinaryPath returns the path to the running multica binary. This is
+// used as the command for the Knowledge MCP stdio proxy (daemon mcp-knowledge),
+// so the tool works without system Node or a developer checkout.
+func multicaBinaryPath() string {
+	// Use os.Executable which resolves the symlink to the real binary path.
+	if exe, err := os.Executable(); err == nil {
+		return exe
+	}
+	// Fallback to os.Args[0] (may be a relative path).
+	return os.Args[0]
+}
+
+// ProxyMCPRequest sends a JSON-RPC request to the backend /api/mcp and returns
+// the response body. Used by the daemon mcp-knowledge subcommand.
+func ProxyMCPRequest(client *http.Client, mcpURL, authToken, workspaceID string, body []byte) ([]byte, error) {
+	req, err := http.NewRequest("POST", mcpURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	if workspaceID != "" {
+		req.Header.Set("X-Workspace-ID", workspaceID)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("backend returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return respBody, nil
 }

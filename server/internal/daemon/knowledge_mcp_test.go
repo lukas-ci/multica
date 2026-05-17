@@ -843,3 +843,103 @@ func TestDeriveKnowledgeMCPURL_trailingSlash(t *testing.T) {
 		t.Fatalf("deriveKnowledgeMCPURL with trailing slash = %q, want %q", got, want)
 	}
 }
+
+// ----- Task 5: MCP packaging tests -----
+
+func TestMulticaBinaryPath_returnsNonEmpty(t *testing.T) {
+	path := multicaBinaryPath()
+	if path == "" {
+		t.Fatal("multicaBinaryPath returned empty string")
+	}
+}
+
+func TestMergeKnowledgeMCP_usesMulticaBinary(t *testing.T) {
+	result := mergeKnowledgeMCP(nil, "http://test:8080", "test-token", "ws-1")
+	if result == nil {
+		t.Fatal("mergeKnowledgeMCP returned nil")
+	}
+
+	var parsed struct {
+		McpServers map[string]struct {
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+			Env     map[string]string `json:"env"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("result not valid JSON: %v", err)
+	}
+	ks, ok := parsed.McpServers["knowledge"]
+	if !ok {
+		t.Fatal("result missing knowledge MCP server")
+	}
+
+	if ks.Command == "node" {
+		t.Fatal("injected config uses 'node' command — should use multica binary")
+	}
+	if len(ks.Args) < 2 || ks.Args[0] != "daemon" || ks.Args[1] != "mcp-knowledge" {
+		t.Fatalf("expected args [daemon mcp-knowledge], got %v", ks.Args)
+	}
+	if ks.Env["MULTICA_AUTH_TOKEN"] != "test-token" {
+		t.Fatalf("expected MULTICA_AUTH_TOKEN=test-token, got %q", ks.Env["MULTICA_AUTH_TOKEN"])
+	}
+	if ks.Env["MULTICA_API_URL"] != "http://test:8080" {
+		t.Fatalf("expected MULTICA_API_URL=http://test:8080, got %q", ks.Env["MULTICA_API_URL"])
+	}
+	if ks.Env["MULTICA_WORKSPACE_ID"] != "ws-1" {
+		t.Fatalf("expected MULTICA_WORKSPACE_ID=ws-1, got %q", ks.Env["MULTICA_WORKSPACE_ID"])
+	}
+}
+
+func TestProxyMCPRequest_success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			w.WriteHeader(401)
+			return
+		}
+		if r.Header.Get("X-Workspace-ID") != "ws-1" {
+			w.WriteHeader(400)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{"result":{"tools":[{"name":"knowledge_search"}]}}`))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	resp, err := ProxyMCPRequest(client, srv.URL+"/api/mcp", "test-token", "ws-1", body)
+	if err != nil {
+		t.Fatalf("proxyMCPRequest returned error: %v", err)
+	}
+	if !strings.Contains(string(resp), "knowledge_search") {
+		t.Fatalf("response missing knowledge_search: %s", resp)
+	}
+}
+
+func TestProxyMCPRequest_401(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	_, err := ProxyMCPRequest(client, srv.URL+"/api/mcp", "bad-token", "ws-1", body)
+	if err == nil {
+		t.Fatal("expected error for 401 response, got nil")
+	}
+	if !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected error mentioning 401, got: %v", err)
+	}
+}
+
+func TestProxyMCPRequest_networkError(t *testing.T) {
+	client := &http.Client{Timeout: time.Second}
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	_, err := ProxyMCPRequest(client, "http://127.0.0.1:1/api/mcp", "", "", body)
+	if err == nil {
+		t.Fatal("expected error for unreachable server, got nil")
+	}
+}
