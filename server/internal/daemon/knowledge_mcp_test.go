@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -942,4 +943,193 @@ func TestProxyMCPRequest_networkError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unreachable server, got nil")
 	}
+}
+
+// ----- MCP protocol tests -----
+
+func TestRunMCPStdioServer_initialize(t *testing.T) {
+	input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+`
+	output, err := runMCPWithIO(input, "")
+	if err != nil {
+		t.Fatalf("runMCPWithIO failed: %v", err)
+	}
+
+	// Should get one response (initialize), notification produces none
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 response line, got %d: %q", len(lines), output)
+	}
+
+	var resp struct {
+		ID     float64                `json:"id"`
+		Result map[string]interface{} `json:"result"`
+		Error  interface{}            `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.ID != 1 {
+		t.Fatalf("expected id 1, got %v", resp.ID)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if resp.Result == nil {
+		t.Fatal("expected result for initialize")
+	}
+}
+
+func TestRunMCPStdioServer_toolsList(t *testing.T) {
+	input := `{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+`
+	output, err := runMCPWithIO(input, "")
+	if err != nil {
+		t.Fatalf("runMCPWithIO failed: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 response line, got %d", len(lines))
+	}
+
+	var resp struct {
+		ID     float64 `json:"id"`
+		Result *struct {
+			Tools []map[string]interface{} `json:"tools"`
+		} `json:"result"`
+		Error interface{} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if resp.Result == nil || len(resp.Result.Tools) == 0 {
+		t.Fatal("expected tools in result")
+	}
+	found := false
+	for _, tool := range resp.Result.Tools {
+		if tool["name"] == "knowledge_search" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected knowledge_search in tools list")
+	}
+}
+
+func TestRunMCPStdioServer_unknownMethod(t *testing.T) {
+	input := `{"jsonrpc":"2.0","id":5,"method":"unknown_method"}
+`
+	output, err := runMCPWithIO(input, "")
+	if err != nil {
+		t.Fatalf("runMCPWithIO failed: %v", err)
+	}
+
+	var resp struct {
+		ID    float64      `json:"id"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error for unknown method")
+	}
+	if resp.Error.Code != -32601 {
+		t.Fatalf("expected error code -32601, got %d", resp.Error.Code)
+	}
+	if resp.ID != 5 {
+		t.Fatalf("expected id 5 preserved in error, got %v", resp.ID)
+	}
+}
+
+func TestRunMCPStdioServer_toolCall(t *testing.T) {
+	// Start a backend server that returns knowledge results
+	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"result":{"content":[{"title":"Test Result","url":"http://example.com","score":0.95,"snippet":"A test result"}]}}`))
+	}))
+	defer backendSrv.Close()
+
+	input := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"knowledge_search","arguments":{"query":"test query"}}}
+`
+	output, err := runMCPWithIO(input, backendSrv.URL)
+	if err != nil {
+		t.Fatalf("runMCPWithIO failed: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 response line, got %d: %s", len(lines), output)
+	}
+
+	var resp struct {
+		ID     float64 `json:"id"`
+		Result *struct {
+			Content []map[string]interface{} `json:"content"`
+		} `json:"result"`
+		Error interface{} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if resp.Result == nil || len(resp.Result.Content) == 0 {
+		t.Fatal("expected content in tool call result")
+	}
+	if resp.ID != 3 {
+		t.Fatalf("expected id 3, got %v", resp.ID)
+	}
+}
+
+func TestRunMCPStdioServer_invalidJSON(t *testing.T) {
+	input := `not valid json
+`
+	output, err := runMCPWithIO(input, "")
+	if err != nil {
+		t.Fatalf("runMCPWithIO failed: %v", err)
+	}
+
+	var resp struct {
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+	if resp.Error.Code != -32700 {
+		t.Fatalf("expected parse error code -32700, got %d", resp.Error.Code)
+	}
+}
+
+// runMCPWithIO is a test helper that runs RunMCPStdioServerWithIO with the given
+// stdin input and returns the stdout output.
+func runMCPWithIO(input, apiURL string) (string, error) {
+	if apiURL == "" {
+		apiURL = "http://test-backend:8080"
+	}
+
+	var buf bytes.Buffer
+	err := RunMCPStdioServerWithIO(
+		strings.NewReader(input),
+		&buf,
+		apiURL,
+		"test-token",
+		"test-ws",
+	)
+	return buf.String(), err
 }

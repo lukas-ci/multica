@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
@@ -402,4 +403,203 @@ func ProxyMCPRequest(client *http.Client, mcpURL, authToken, workspaceID string,
 	}
 
 	return respBody, nil
+}
+
+// jsonrpcMessage is a minimal JSON-RPC message for MCP stdio parsing.
+type jsonrpcMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type jsonrpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  interface{}     `json:"result,omitempty"`
+	Error   *jsonrpcError   `json:"error,omitempty"`
+}
+
+type jsonrpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// RunMCPStdioServerWithIO implements a stdio MCP server that handles the Knowledge
+// tool lifecycle, using the given reader/writer instead of os.Stdin/os.Stdout.
+// This allows testing without replacing global stdin/stdout.
+func RunMCPStdioServerWithIO(r io.Reader, w io.Writer, apiURL, authToken, workspaceID string) error {
+	mcpURL := strings.TrimRight(apiURL, "/") + "/api/mcp"
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var msg jsonrpcMessage
+		if err := json.Unmarshal(line, &msg); err != nil {
+			writeErrorTo(w, nil, -32700, "Parse error: "+err.Error())
+			continue
+		}
+
+		if msg.ID == nil {
+			continue
+		}
+
+		var resp jsonrpcResponse
+		resp.JSONRPC = "2.0"
+		resp.ID = msg.ID
+
+		switch msg.Method {
+		case "initialize":
+			resp.Result = map[string]interface{}{
+				"protocolVersion": "2024-11-05",
+				"capabilities": map[string]interface{}{
+					"tools": map[string]interface{}{},
+				},
+				"serverInfo": map[string]interface{}{
+					"name":    "multica-knowledge",
+					"version": "1.0.0",
+				},
+			}
+
+		case "ping":
+			resp.Result = map[string]interface{}{}
+
+		case "tools/list":
+			resp.Result = map[string]interface{}{
+				"tools": []map[string]interface{}{
+					{
+						"name":        "knowledge_search",
+						"description": "Search indexed knowledge sources (Confluence, GitHub, etc.) linked to the current workspace.",
+						"inputSchema": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"query": map[string]interface{}{
+									"type":        "string",
+									"description": "Search query",
+								},
+								"limit": map[string]interface{}{
+									"type":        "integer",
+									"description": "Max results (default 10)",
+								},
+							},
+							"required": []string{"query"},
+						},
+					},
+				},
+			}
+
+		case "tools/call":
+			result, err := handleToolCall(client, mcpURL, authToken, workspaceID, msg.Params)
+			if err != nil {
+				resp.Error = &jsonrpcError{Code: -32603, Message: err.Error()}
+			} else {
+				resp.Result = result
+			}
+
+		default:
+			resp.Error = &jsonrpcError{
+				Code:    -32601,
+				Message: fmt.Sprintf("Method not found: %s", msg.Method),
+			}
+		}
+
+		data, _ := json.Marshal(resp)
+		w.Write(data)
+		w.Write([]byte("\n"))
+	}
+
+	return scanner.Err()
+}
+
+// RunMCPStdioServer is like RunMCPStdioServerWithIO but uses os.Stdin/os.Stdout.
+func RunMCPStdioServer(apiURL, authToken, workspaceID string) error {
+	return RunMCPStdioServerWithIO(os.Stdin, os.Stdout, apiURL, authToken, workspaceID)
+}
+
+// handleToolCall processes a tools/call request by forwarding it to the backend
+// /api/mcp endpoint.
+func handleToolCall(client *http.Client, mcpURL, authToken, workspaceID string, params json.RawMessage) (interface{}, error) {
+	// Parse the tool call params
+	var callParams struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(params, &callParams); err != nil {
+		return nil, fmt.Errorf("invalid tool call params: %w", err)
+	}
+
+	if callParams.Name != "knowledge_search" {
+		return nil, fmt.Errorf("Unknown tool: %s", callParams.Name)
+	}
+
+	// Build the backend request
+	backendBody := map[string]interface{}{
+		"method": "tools/call",
+		"params": map[string]interface{}{
+			"name":      "knowledge_search",
+			"arguments": callParams.Arguments,
+		},
+	}
+	bodyData, _ := json.Marshal(backendBody)
+
+	respBody, err := ProxyMCPRequest(client, mcpURL, authToken, workspaceID, bodyData)
+	if err != nil {
+		return nil, fmt.Errorf("backend request failed: %w", err)
+	}
+
+	// Parse the backend response
+	var backendResp struct {
+		Result *struct {
+			Content []map[string]interface{} `json:"content"`
+		} `json:"result"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &backendResp); err != nil {
+		return nil, fmt.Errorf("parse backend response: %w", err)
+	}
+
+	if backendResp.Error != nil {
+		return nil, fmt.Errorf("search failed: %s", backendResp.Error.Message)
+	}
+
+	// Format the results for the agent
+	results := backendResp.Result.Content
+	text := "No results found."
+	if len(results) > 0 {
+		var parts []string
+		for _, r := range results {
+			title, _ := r["title"].(string)
+			url, _ := r["url"].(string)
+			score, _ := r["score"].(float64)
+			snippet, _ := r["snippet"].(string)
+			parts = append(parts, fmt.Sprintf("[%.2f] %s\n%s\n%s", score, title, url, snippet))
+		}
+		text = strings.Join(parts, "\n\n")
+	}
+
+	return map[string]interface{}{
+		"content": []map[string]interface{}{
+			{"type": "text", "text": text},
+		},
+	}, nil
+}
+
+func writeErrorTo(w io.Writer, id json.RawMessage, code int, message string) {
+	resp := jsonrpcResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error:   &jsonrpcError{Code: code, Message: message},
+	}
+	data, _ := json.Marshal(resp)
+	w.Write(data)
+	w.Write([]byte("\n"))
 }
