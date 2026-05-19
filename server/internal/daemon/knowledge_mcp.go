@@ -71,15 +71,18 @@ const (
 //  1. GET <baseURL>/api/capabilities — typed endpoint; 200 is accepted as
 //     supported without parsing the body.
 //  2. POST <baseURL>/api/mcp with tools/list JSON-RPC — authenticates with the
-//     given token. 200 + knowledge_search in tools → supported; 401 → auth
-//     failure; 404/405 → unsupported; 5xx/network → transient.
-func probeKnowledgeMCPCap(client *http.Client, baseURL, token string) knowledgeCapability {
+//     given token and workspace ID. 200 + knowledge_search in tools → supported;
+//     401 → auth failure; 404/405 → unsupported; 5xx/network → transient.
+func probeKnowledgeMCPCap(client *http.Client, baseURL, token, workspaceID string) knowledgeCapability {
 	// Step 1: typed /api/capabilities endpoint.
 	capURL := strings.TrimRight(baseURL, "/") + "/api/capabilities"
 	req, err := http.NewRequest("GET", capURL, nil)
 	if err == nil {
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if workspaceID != "" {
+			req.Header.Set("X-Workspace-ID", workspaceID)
 		}
 		resp, doErr := client.Do(req)
 		if doErr == nil {
@@ -105,6 +108,9 @@ func probeKnowledgeMCPCap(client *http.Client, baseURL, token string) knowledgeC
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if workspaceID != "" {
+		req.Header.Set("X-Workspace-ID", workspaceID)
 	}
 
 	resp, err := client.Do(req)
@@ -215,7 +221,7 @@ func (d *Daemon) injectKnowledgeMCP(mcpConfig json.RawMessage, workspaceID strin
 		return mcpConfig
 	}
 	token := d.daemonProfileToken()
-	switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL); cap {
+	switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL, workspaceID); cap {
 	case knowledgeCapSupported:
 		result := mergeKnowledgeMCP(mcpConfig, mcpURL, token, workspaceID)
 		if d.logger != nil {
@@ -253,7 +259,7 @@ func (d *Daemon) daemonProfileToken() string {
 // e.g. "http://localhost:8080") for Knowledge MCP support, consulting and
 // updating the probe cache. Concurrent callers for the same (serverURL, token)
 // pair collapse to a single probe.
-func (d *Daemon) knowledgeMCPCapability(serverBaseURL string) knowledgeCapability {
+func (d *Daemon) knowledgeMCPCapability(serverBaseURL, workspaceID string) knowledgeCapability {
 	token := d.daemonProfileToken()
 	key := probeCacheKey(serverBaseURL, token)
 
@@ -265,7 +271,7 @@ func (d *Daemon) knowledgeMCPCapability(serverBaseURL string) knowledgeCapabilit
 	// Not cached — probe under the lock so concurrent callers for the same
 	// key do not stampede the backend.
 	client := &http.Client{Timeout: 10 * time.Second}
-	cap := probeKnowledgeMCPCap(client, serverBaseURL, token)
+	cap := probeKnowledgeMCPCap(client, serverBaseURL, token, workspaceID)
 	d.knowledgeProbeCache.set(key, cap)
 	d.knowledgeProbeMu.Unlock()
 	return cap

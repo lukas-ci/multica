@@ -120,7 +120,7 @@ func TestProbeKnowledgeMCPCap_capabilities200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapSupported {
 		t.Fatalf("expected supported, got %v", cap)
 	}
@@ -141,7 +141,7 @@ func TestProbeKnowledgeMCPCap_capabilities404_fallbackToMCP_supported(t *testing
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapSupported {
 		t.Fatalf("expected supported, got %v", cap)
 	}
@@ -159,7 +159,7 @@ func TestProbeKnowledgeMCPCap_mcp200_noKnowledgeSearch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapUnsupported {
 		t.Fatalf("expected unsupported, got %v", cap)
 	}
@@ -176,7 +176,7 @@ func TestProbeKnowledgeMCPCap_mcp401(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "some-token")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "some-token", "")
 	if cap != knowledgeCapAuthFailure {
 		t.Fatalf("expected auth_failure, got %v", cap)
 	}
@@ -192,7 +192,7 @@ func TestProbeKnowledgeMCPCap_mcp404(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapUnsupported {
 		t.Fatalf("expected unsupported, got %v", cap)
 	}
@@ -208,7 +208,7 @@ func TestProbeKnowledgeMCPCap_mcp405(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapUnsupported {
 		t.Fatalf("expected unsupported, got %v", cap)
 	}
@@ -224,7 +224,7 @@ func TestProbeKnowledgeMCPCap_mcp5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapTransient {
 		t.Fatalf("expected transient, got %v", cap)
 	}
@@ -243,7 +243,7 @@ func TestProbeKnowledgeMCPCap_capabilities5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "")
+	cap := probeKnowledgeMCPCap(srv.Client(), srv.URL, "", "")
 	if cap != knowledgeCapTransient {
 		t.Fatalf("expected transient, got %v", cap)
 	}
@@ -255,7 +255,7 @@ func TestProbeKnowledgeMCPCap_capabilities5xx(t *testing.T) {
 func TestProbeKnowledgeMCPCap_networkError(t *testing.T) {
 	// Point at a server that does not exist → transient
 	client := &http.Client{Timeout: time.Second}
-	cap := probeKnowledgeMCPCap(client, "http://127.0.0.1:1", "")
+	cap := probeKnowledgeMCPCap(client, "http://127.0.0.1:1", "", "")
 	if cap != knowledgeCapTransient {
 		t.Fatalf("expected transient, got %v", cap)
 	}
@@ -273,7 +273,7 @@ func TestProbeKnowledgeMCPCap_authorizationHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	probeKnowledgeMCPCap(srv.Client(), srv.URL, "test-token-123")
+	probeKnowledgeMCPCap(srv.Client(), srv.URL, "test-token-123", "")
 	if gotToken != "Bearer test-token-123" {
 		t.Fatalf("expected Authorization: Bearer test-token-123, got %q", gotToken)
 	}
@@ -410,7 +410,7 @@ func TestKnowledgeMCPCapability_wiring(t *testing.T) {
 	d.cfg.ServerBaseURL = srv.URL
 
 	// First call: probe, cache miss
-	cap := d.knowledgeMCPCapability(srv.URL)
+	cap := d.knowledgeMCPCapability(srv.URL, "")
 	if cap != knowledgeCapSupported {
 		t.Fatalf("first call: expected supported, got %v", cap)
 	}
@@ -422,7 +422,7 @@ func TestKnowledgeMCPCapability_wiring(t *testing.T) {
 	}
 
 	// Second call: should use cache, no new requests
-	cap = d.knowledgeMCPCapability(srv.URL)
+	cap = d.knowledgeMCPCapability(srv.URL, "")
 	if cap != knowledgeCapSupported {
 		t.Fatalf("second call (cached): expected supported, got %v", cap)
 	}
@@ -451,7 +451,7 @@ func TestKnowledgeMCPCapability_wiring_fallback(t *testing.T) {
 		knowledgeProbeCache: newKnowledgeProbeCache(),
 	}
 
-	cap := d.knowledgeMCPCapability(srv.URL)
+	cap := d.knowledgeMCPCapability(srv.URL, "")
 	if cap != knowledgeCapSupported {
 		t.Fatalf("expected supported via /api/mcp fallback, got %v", cap)
 	}
@@ -475,7 +475,7 @@ func TestKnowledgeMCPCapability_wiring_unsupported(t *testing.T) {
 		knowledgeProbeCache: newKnowledgeProbeCache(),
 	}
 
-	cap := d.knowledgeMCPCapability(srv.URL)
+	cap := d.knowledgeMCPCapability(srv.URL, "")
 	if cap != knowledgeCapUnsupported {
 		t.Fatalf("expected unsupported, got %v", cap)
 	}
@@ -488,7 +488,7 @@ func TestKnowledgeMCPCapability_wiring_transient(t *testing.T) {
 	}
 
 	// Point at a port that will refuse/not connect
-	cap := d.knowledgeMCPCapability("http://127.0.0.1:1")
+	cap := d.knowledgeMCPCapability("http://127.0.0.1:1", "")
 	if cap != knowledgeCapTransient {
 		t.Fatalf("expected transient, got %v", cap)
 	}
