@@ -217,7 +217,15 @@ func (d *Daemon) injectKnowledgeMCP(mcpConfig json.RawMessage, workspaceID strin
 	token := d.daemonProfileToken()
 	switch cap := d.knowledgeMCPCapability(d.cfg.ServerBaseURL); cap {
 	case knowledgeCapSupported:
-		return mergeKnowledgeMCP(mcpConfig, mcpURL, token, workspaceID)
+		result := mergeKnowledgeMCP(mcpConfig, mcpURL, token, workspaceID)
+		if d.logger != nil {
+			d.logger.Info("injected knowledge MCP config",
+				"command", multicaBinaryPath(),
+				"args", []string{"daemon", "mcp-knowledge"},
+				"workspace_id", workspaceID,
+			)
+		}
+		return result
 	case knowledgeCapAuthFailure:
 		d.logger.Warn("knowledge MCP disabled: auth failure against backend; check login", "url", mcpURL)
 	case knowledgeCapUnsupported:
