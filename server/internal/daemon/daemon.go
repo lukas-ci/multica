@@ -105,6 +105,12 @@ type Daemon struct {
 	// goroutine can race against t.TempDir cleanup, leaving a partially
 	// deleted bare clone and an unrelated `not empty` cleanup failure.
 	bgSyncs sync.WaitGroup
+
+	// knowledgeProbeCache caches backend capability probe results so the
+	// daemon does not hammer an unsupported or known-to-fail backend on
+	// every task dispatch.
+	knowledgeProbeCache *knowledgeProbeCache
+	knowledgeProbeMu    sync.Mutex
 }
 
 // New creates a new Daemon instance.
@@ -127,6 +133,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		activeEnvRoots:        make(map[string]int),
 		runtimeGoneInflight:   make(map[string]struct{}),
 		reregisterNextAttempt: make(map[string]time.Time),
+		knowledgeProbeCache:   newKnowledgeProbeCache(),
 	}
 }
 
@@ -2137,11 +2144,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		mcpConfig = task.Agent.McpConfig
 	}
 	// Framework-level: auto-inject knowledge_search MCP tool if the
-	// backend has the knowledge service enabled. Merges into any
-	// existing agent-level MCP config so agents always discover it.
-	if baseURL := os.Getenv("MULTICA_KNOWLEDGE_MCP_URL"); baseURL != "" {
-		mcpConfig = mergeKnowledgeMCP(mcpConfig, baseURL, task.WorkspaceID)
-	}
+	// backend supports it. Delegates to injectKnowledgeMCP so the exact
+	// URL resolution → probe → injection path is testable in one call.
+	mcpConfig = d.injectKnowledgeMCP(mcpConfig, task.WorkspaceID)
 	// Two-tier model resolution: an explicit agent.model wins,
 	// then the daemon-wide MULTICA_<PROVIDER>_MODEL env var. If
 	// both are empty we deliberately pass "" through — each

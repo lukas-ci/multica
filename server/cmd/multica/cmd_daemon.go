@@ -112,6 +112,26 @@ func init() {
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonLogsCmd)
 	daemonCmd.AddCommand(daemonDiskUsageCmd)
+	daemonCmd.AddCommand(daemonKnowledgeMCPCmd)
+}
+
+// daemonKnowledgeMCPCmd implements a stdio MCP server for the Knowledge tool.
+// It handles MCP protocol lifecycle (initialize, tools/list, tools/call)
+// as a self-contained Go implementation — no system Node or dev checkout needed.
+var daemonKnowledgeMCPCmd = &cobra.Command{
+	Use:   "mcp-knowledge",
+	Short: "Knowledge MCP stdio server (internal)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		apiURL := os.Getenv("MULTICA_API_URL")
+		authToken := os.Getenv("MULTICA_AUTH_TOKEN")
+		workspaceID := os.Getenv("MULTICA_WORKSPACE_ID")
+
+		if apiURL == "" {
+			return fmt.Errorf("MULTICA_API_URL not set")
+		}
+
+		return daemon.RunMCPStdioServer(apiURL, authToken, workspaceID)
+	},
 }
 
 // daemonDirForProfile returns the state directory for the given profile.

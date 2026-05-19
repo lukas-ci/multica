@@ -28,7 +28,7 @@ const LOG_TAIL_MAX_RETRIES = 5;
 
 const DEFAULT_PREFS: DaemonPrefs = { autoStart: true, autoStop: false };
 
-interface ActiveProfile {
+export interface ActiveProfile {
   name: string; // "" = default profile
   port: number;
 }
@@ -48,27 +48,58 @@ let pendingVersionRestart = false;
 let targetApiBaseUrl: string | null = null;
 let activeProfile: ActiveProfile | null = null;
 
+// Test helpers (only exported outside module; not used in production).
+// These let tests set module-level state without exporting the real mutables.
+export function __setTargetApiBaseUrl(url: string | null): void {
+  targetApiBaseUrl = url;
+}
+export function __setActiveProfile(profile: ActiveProfile | null): void {
+  activeProfile = profile;
+}
+
+// When set, overrides os.homedir() for profile paths so tests can use temp
+// directories without mocking the os module. Production code never sets this.
+let testHomeDir: string | null = null;
+export function __setTestHomeDir(dir: string | null): void {
+  testHomeDir = dir;
+}
+
+// When set, skips findCliOnPath/bundledCliPath and returns this value directly.
+// Used by tests to avoid mocking Electron's app.getAppPath().
+let testCliBinary: string | null = null;
+export function __setTestCliBinary(bin: string | null): void {
+  testCliBinary = bin;
+}
+
 // Serialize all writes to any profile config file. Multiple paths
 // (syncToken, resolveActiveProfile, clearToken, watch/unwatch handlers)
 // may try to write concurrently; chaining them avoids interleaved writes
 // corrupting the JSON.
 let configWriteChain: Promise<void> = Promise.resolve();
 
+// Test seam: when set, startDaemon uses this instead of the real execFile.
+// Avoids vitest ESM mock hoisting issues with child_process.
+let testExecFile: ((...args: any[]) => any) | null = null;
+export function __setTestExecFile(fn: ((...args: any[]) => any) | null): void {
+  testExecFile = fn;
+}
+
 // Keep the Go impl in sync: server/cmd/multica/cmd_daemon.go healthPortForProfile.
-function healthPortForProfile(profile: string): number {
+export function healthPortForProfile(profile: string): number {
   if (!profile) return DEFAULT_HEALTH_PORT;
   let sum = 0;
   for (const b of Buffer.from(profile, "utf-8")) sum += b;
   return DEFAULT_HEALTH_PORT + 1 + (sum % 1000);
 }
 
-function profileDir(profile: string): string {
+export function profileDir(profile: string): string {
+  const home = testHomeDir ?? homedir();
   return profile
-    ? join(homedir(), ".multica", "profiles", profile)
-    : join(homedir(), ".multica");
+    ? join(home, ".multica", "profiles", profile)
+    : join(home, ".multica");
 }
 
-function profileConfigPath(profile: string): string {
+export function profileConfigPath(profile: string): string {
   return join(profileDir(profile), "config.json");
 }
 
@@ -110,7 +141,7 @@ async function removeProfileUserId(profile: string): Promise<void> {
   }
 }
 
-function normalizeUrl(u: string): string {
+export function normalizeUrl(u: string): string {
   if (!u) return "";
   try {
     const parsed = new URL(u);
@@ -120,7 +151,7 @@ function normalizeUrl(u: string): string {
   }
 }
 
-function urlsMatch(a: string, b: string): boolean {
+export function urlsMatch(a: string, b: string): boolean {
   const na = normalizeUrl(a);
   const nb = normalizeUrl(b);
   return na.length > 0 && na === nb;
@@ -164,7 +195,7 @@ async function fetchHealthAtPort(
 // Desktop owns a dedicated CLI profile named after the target API host, so it
 // never reads or writes the user's hand-configured profiles. Profile dir:
 //   ~/.multica/profiles/desktop-<host>/
-function deriveProfileName(targetUrl: string): string {
+export function deriveProfileName(targetUrl: string): string {
   try {
     const url = new URL(targetUrl);
     const host = url.host.replace(/:/g, "-").toLowerCase();
@@ -211,7 +242,7 @@ async function writeProfileConfig(
  * profile whose name doesn't start with `desktop-`, so the user's manually
  * configured CLI profiles are untouched.
  */
-async function resolveActiveProfile(): Promise<ActiveProfile> {
+export async function resolveActiveProfile(): Promise<ActiveProfile> {
   const target = targetApiBaseUrl;
   if (!target) return { name: "", port: DEFAULT_HEALTH_PORT };
 
@@ -363,6 +394,7 @@ async function probeCliBinary(
  * installs are de-duplicated via `cliResolvePromise`.
  */
 async function resolveCliBinary(): Promise<string | null> {
+  if (testCliBinary) return testCliBinary;
   if (cachedCliBinary !== undefined) return cachedCliBinary;
   if (cliResolvePromise) return cliResolvePromise;
 
@@ -539,7 +571,7 @@ async function mintPat(jwt: string): Promise<string> {
  * - When we mint fresh and a daemon is already running, restart it so the
  *   new credentials take effect (the Go daemon reads config at startup).
  */
-async function syncToken(
+export async function syncToken(
   tokenFromRenderer: string,
   userId: string,
 ): Promise<void> {
@@ -632,7 +664,7 @@ async function withGuard<T>(fn: () => Promise<T>): Promise<T | { success: false;
   }
 }
 
-function profileArgs(active: ActiveProfile): string[] {
+export function profileArgs(active: ActiveProfile): string[] {
   return active.name ? ["--profile", active.name] : [];
 }
 
@@ -641,11 +673,16 @@ function profileArgs(active: ActiveProfile): string[] {
 // hide CLI self-update UI. Computed lazily so it picks up the PATH fix
 // applied by fix-path in main/index.ts — as a top-level const it would
 // snapshot process.env at import time, before that block runs.
-function desktopSpawnEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, MULTICA_LAUNCHED_BY: "desktop" };
+//
+// MULTICA_KNOWLEDGE_MCP_URL is explicitly stripped: the daemon's own URL
+// derivation (Task 1) must not be overridden by an inherited env var.
+export function desktopSpawnEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env, MULTICA_LAUNCHED_BY: "desktop" };
+  delete env.MULTICA_KNOWLEDGE_MCP_URL;
+  return env;
 }
 
-async function startDaemon(): Promise<{ success: boolean; error?: string }> {
+export async function startDaemon(): Promise<{ success: boolean; error?: string }> {
   const bin = await resolveCliBinary();
   if (!bin) return { success: false, error: "multica CLI is not installed" };
 
@@ -662,11 +699,12 @@ async function startDaemon(): Promise<{ success: boolean; error?: string }> {
   const args = ["daemon", "start", ...profileArgs(active)];
 
   return new Promise((resolve) => {
-    execFile(
+    const spawnFn = testExecFile ?? execFile;
+    spawnFn(
       bin,
       args,
       { timeout: 20_000, env: desktopSpawnEnv() },
-      (err) => {
+      (err: any) => {
         if (err) {
           currentState = "stopped";
           sendStatus({ state: "stopped" });
