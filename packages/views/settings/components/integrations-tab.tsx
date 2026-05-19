@@ -1,15 +1,14 @@
 "use client";
 
 import { useState } from "react";
-import { Trash2 } from "lucide-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@multica/ui/components/ui/button";
 import { Card, CardContent } from "@multica/ui/components/ui/card";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { memberListOptions } from "@multica/core/workspace/queries";
-import { githubInstallationsOptions, githubKeys } from "@multica/core/github/queries";
+import { githubInstallationsOptions } from "@multica/core/github/queries";
 import { api } from "@multica/core/api";
 import { useT } from "../../i18n";
 
@@ -27,21 +26,19 @@ export function IntegrationsTab() {
   const { t } = useT("settings");
   const wsId = useWorkspaceId();
   const user = useAuthStore((s) => s.user);
-  const qc = useQueryClient();
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const [connecting, setConnecting] = useState(false);
 
   const currentMember = members.find((m) => m.user_id === user?.id) ?? null;
   const canManage = currentMember?.role === "owner" || currentMember?.role === "admin";
 
-  // The list endpoint is admin-only; non-admins would see a 403 toast and
-  // an empty configured state. Gate the query on canManage so members get
-  // a clean read-only view.
-  const { data, isLoading } = useQuery({
+  // Only used to gate the Connect button + show a "not configured" hint;
+  // we no longer render the installation list here — admins manage existing
+  // installations on GitHub directly via the Connect flow.
+  const { data } = useQuery({
     ...githubInstallationsOptions(wsId),
     enabled: !!wsId && canManage,
   });
-  const installations = data?.installations ?? [];
   const configured = data?.configured ?? false;
 
   async function handleConnect() {
@@ -57,16 +54,6 @@ export function IntegrationsTab() {
       toast.error(e instanceof Error ? e.message : t(($) => $.integrations.toast_open_failed));
     } finally {
       setConnecting(false);
-    }
-  }
-
-  async function handleDisconnect(installationDbId: string) {
-    try {
-      await api.deleteGitHubInstallation(wsId, installationDbId);
-      qc.invalidateQueries({ queryKey: githubKeys.installations(wsId) });
-      toast.success(t(($) => $.integrations.toast_disconnected));
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : t(($) => $.integrations.toast_disconnect_failed));
     }
   }
 
@@ -113,55 +100,6 @@ export function IntegrationsTab() {
                 {t(($) => $.integrations.not_configured_and)}{" "}
                 <code className="rounded bg-muted px-1 py-0.5 text-[10px]">GITHUB_WEBHOOK_SECRET</code>.
               </p>
-            )}
-
-            {canManage && configured && (
-              <div className="space-y-2">
-                {isLoading && <p className="text-xs text-muted-foreground">{t(($) => $.integrations.loading)}</p>}
-                {!isLoading && installations.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    {t(($) => $.integrations.empty)}
-                  </p>
-                )}
-                {installations.map((inst) => (
-                  <div
-                    key={inst.id}
-                    className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      {inst.account_avatar_url && (
-                        <img
-                          src={inst.account_avatar_url}
-                          alt=""
-                          className="h-6 w-6 rounded-full shrink-0"
-                        />
-                      )}
-                      <div className="min-w-0">
-                        <p className="text-sm font-medium truncate">{inst.account_login}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {t(($) => $.integrations.connected_at, {
-                            type: inst.account_type,
-                            date: new Date(inst.created_at).toLocaleDateString("en-US", {
-                              month: "short",
-                              day: "numeric",
-                            }),
-                          })}
-                        </p>
-                      </div>
-                    </div>
-                    {canManage && (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-muted-foreground hover:text-destructive shrink-0"
-                        onClick={() => handleDisconnect(inst.id)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
-                    )}
-                  </div>
-                ))}
-              </div>
             )}
 
             {!canManage && (

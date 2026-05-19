@@ -48,8 +48,18 @@ func (h *Handler) requireDaemonWorkspaceAccess(w http.ResponseWriter, r *http.Re
 		return true
 	}
 
-	// PAT/JWT fallback: verify user is a member of the workspace.
+	// PAT/JWT fallback: check membership cache before hitting DB.
+	userID := requestUserID(r)
+	if userID != "" {
+		if h.MembershipCache.Get(r.Context(), userID, workspaceID) {
+			return true
+		}
+	}
+
 	_, ok := h.requireWorkspaceMember(w, r, workspaceID, "not found")
+	if ok && userID != "" {
+		h.MembershipCache.Set(r.Context(), userID, workspaceID)
+	}
 	return ok
 }
 
@@ -125,8 +135,15 @@ func (h *Handler) verifyDaemonWorkspaceAccess(r *http.Request, workspaceID strin
 	if userID == "" {
 		return false
 	}
+	if h.MembershipCache.Get(r.Context(), userID, workspaceID) {
+		return true
+	}
 	_, err := h.getWorkspaceMember(r.Context(), userID, workspaceID)
-	return err == nil
+	if err != nil {
+		return false
+	}
+	h.MembershipCache.Set(r.Context(), userID, workspaceID)
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -584,7 +601,8 @@ func (h *Handler) DaemonDeregister(w http.ResponseWriter, r *http.Request) {
 }
 
 type DaemonHeartbeatRequest struct {
-	RuntimeID string `json:"runtime_id"`
+	RuntimeID           string `json:"runtime_id"`
+	SupportsBatchImport bool   `json:"supports_batch_import,omitempty"`
 }
 
 // heartbeatHasPendingTimeout bounds the cheap HasPending probe on the
@@ -598,6 +616,16 @@ type DaemonHeartbeatRequest struct {
 // therefore only invoke PopPending after HasPending confirms there is work
 // to claim, so we never start a claim we might have to abort.
 const heartbeatHasPendingTimeout = 1 * time.Second
+
+// maxLocalSkillImportBatch is how many pending import requests the heartbeat
+// handler pops per cycle. Higher values let the daemon process more imports
+// in parallel but increase per-heartbeat latency.
+//
+// Timeout invariant: IMPORT_CONCURRENCY (views/.../runtime-local-skill-import-panel.tsx)
+// × heartbeat period (~15s) must stay within runtimeLocalSkillPendingTimeout
+// (runtime_local_skills.go), and IMPORT_POLL_TIMEOUT_MS (core/runtimes/local-skills.ts)
+// must exceed pendingTimeout + runningTimeout.
+const maxLocalSkillImportBatch = 10
 
 // runtimeLivenessTTL is how long a Redis liveness record stays valid before
 // expiring. The daemon refreshes it every heartbeat (~15s), so this just
@@ -705,7 +733,7 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	authMs = time.Since(start).Milliseconds()
 
-	ack, m, err := h.processHeartbeat(r.Context(), rt)
+	ack, m, err := h.processHeartbeat(r.Context(), rt, req.SupportsBatchImport)
 	updateMs = m.UpdateMs
 	probeModelMs = m.ProbeModelMs
 	popModelMs = m.PopModelMs
@@ -739,6 +767,9 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if ack.PendingLocalSkillImport != nil {
 		resp["pending_local_skill_import"] = ack.PendingLocalSkillImport
 	}
+	if len(ack.PendingLocalSkillImports) > 0 {
+		resp["pending_local_skill_imports"] = ack.PendingLocalSkillImports
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -756,7 +787,7 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 // and tells the daemon to drop the stale runtime and re-register. Other DB
 // errors still propagate as errors so they keep their existing Warn logging
 // and the daemon does not mistake a hiccup for a deletion.
-func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws.ClientIdentity, runtimeID string) (*protocol.DaemonHeartbeatAckPayload, error) {
+func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws.ClientIdentity, runtimeID string, supportsBatchImport bool) (*protocol.DaemonHeartbeatAckPayload, error) {
 	runtimeUUID, err := util.ParseUUID(runtimeID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid runtime_id: %w", err)
@@ -775,7 +806,7 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 	if identity.WorkspaceID != "" && identity.WorkspaceID != uuidToString(rt.WorkspaceID) {
 		return nil, fmt.Errorf("runtime not in connection workspace")
 	}
-	ack, _, err := h.processHeartbeat(ctx, rt)
+	ack, _, err := h.processHeartbeat(ctx, rt, supportsBatchImport)
 	return ack, err
 }
 
@@ -836,7 +867,7 @@ type heartbeatMetrics struct {
 // the WebSocket daemon:heartbeat path: records liveness and pulls any pending
 // actions queued for the runtime. Auth and request decoding live in the
 // caller because they differ between transports.
-func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime) (*protocol.DaemonHeartbeatAckPayload, heartbeatMetrics, error) {
+func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime, supportsBatchImport bool) (*protocol.DaemonHeartbeatAckPayload, heartbeatMetrics, error) {
 	var m heartbeatMetrics
 	runtimeID := uuidToString(rt.ID)
 
@@ -940,14 +971,42 @@ func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime) (*pr
 	switch {
 	case probeErr == nil && hasImport:
 		popStart := time.Now()
-		pendingImport, popErr := h.LocalSkillImportStore.PopPending(ctx, runtimeID)
-		m.PopImportMs = time.Since(popStart).Milliseconds()
-		if popErr != nil {
-			slog.Warn("local skill import PopPending failed", "error", popErr, "runtime_id", runtimeID)
-		} else if pendingImport != nil {
-			ack.PendingLocalSkillImport = &protocol.DaemonHeartbeatPendingLocalSkillImport{
-				ID:       pendingImport.ID,
-				SkillKey: pendingImport.SkillKey,
+		if supportsBatchImport {
+			pendingImports, popErr := h.LocalSkillImportStore.PopPendingBatch(ctx, runtimeID, maxLocalSkillImportBatch)
+			m.PopImportMs = time.Since(popStart).Milliseconds()
+			if popErr != nil {
+				slog.Warn("local skill import PopPendingBatch failed", "error", popErr, "runtime_id", runtimeID, "claimed", len(pendingImports))
+			}
+			// Always dispatch whatever was claimed — even on partial
+			// failure the claimed requests have already transitioned to
+			// running in the store. Dropping them here would leave them
+			// stranded until the running timeout.
+			if len(pendingImports) > 0 {
+				// Backwards compat: singular field carries the first item so
+				// old daemons that don't know the plural field still get one.
+				ack.PendingLocalSkillImport = &protocol.DaemonHeartbeatPendingLocalSkillImport{
+					ID:       pendingImports[0].ID,
+					SkillKey: pendingImports[0].SkillKey,
+				}
+				batch := make([]protocol.DaemonHeartbeatPendingLocalSkillImport, 0, len(pendingImports))
+				for _, p := range pendingImports {
+					batch = append(batch, protocol.DaemonHeartbeatPendingLocalSkillImport{
+						ID:       p.ID,
+						SkillKey: p.SkillKey,
+					})
+				}
+				ack.PendingLocalSkillImports = batch
+			}
+		} else {
+			pendingImport, popErr := h.LocalSkillImportStore.PopPending(ctx, runtimeID)
+			m.PopImportMs = time.Since(popStart).Milliseconds()
+			if popErr != nil {
+				slog.Warn("local skill import PopPending failed", "error", popErr, "runtime_id", runtimeID)
+			} else if pendingImport != nil {
+				ack.PendingLocalSkillImport = &protocol.DaemonHeartbeatPendingLocalSkillImport{
+					ID:       pendingImport.ID,
+					SkillKey: pendingImport.SkillKey,
+				}
 			}
 		}
 	case probeErr != nil:
@@ -1108,6 +1167,32 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		if issue, err := h.Queries.GetIssue(r.Context(), task.IssueID); err == nil {
 			resp.WorkspaceID = uuidToString(issue.WorkspaceID)
 
+			// Squad-leader briefing injection: when the issue is assigned
+			// to a squad and the claiming agent is that squad's current
+			// leader, append a full briefing (Operating Protocol + Roster
+			// + user Instructions) to the agent's own Instructions. We
+			// append (not replace) so per-agent instructions remain
+			// authoritative for general behavior; the squad briefing
+			// stacks on top as task-specific squad context.
+			if resp.Agent != nil && issue.AssigneeType.Valid && issue.AssigneeType.String == "squad" && issue.AssigneeID.Valid {
+				if squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+					ID:          issue.AssigneeID,
+					WorkspaceID: issue.WorkspaceID,
+				}); err == nil && uuidToString(squad.LeaderID) == resp.Agent.ID {
+					briefing := buildSquadLeaderBriefing(r.Context(), h.Queries, squad)
+					if strings.TrimSpace(resp.Agent.Instructions) == "" {
+						resp.Agent.Instructions = briefing
+					} else {
+						resp.Agent.Instructions = resp.Agent.Instructions + "\n\n" + briefing
+					}
+					slog.Debug("injected squad leader briefing",
+						"squad_id", uuidToString(squad.ID),
+						"squad_name", squad.Name,
+						"leader_agent_id", resp.Agent.ID,
+					)
+				}
+			}
+
 			var projectRepos []RepoData
 			if issue.ProjectID.Valid {
 				resp.ProjectID = uuidToString(issue.ProjectID)
@@ -1189,16 +1274,21 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		// Look up the prior session for this (agent, issue) pair so the daemon
 		// can resume the Claude Code conversation context.
 		//
-		// Skip the lookup when the task was flagged as a manual rerun: the
-		// user just judged the prior output bad, so the daemon must start a
-		// fresh agent session instead of resuming the same conversation that
-		// produced that output.
+		// Skip all prior state when the task was flagged as a manual rerun:
+		// the user just judged the prior output bad, so the daemon must start a
+		// fresh agent session in a fresh workdir instead of resuming anything
+		// from the same conversation that produced that output. For
+		// comment-triggered follow-ups, skip only the session resume: resumed
+		// issue conversations often inherit the prior final assistant message
+		// (for example "Done.") and answer a new human comment with that stale
+		// completion marker instead of the comment itself. Keep reusing the
+		// workdir for comment follow-ups so the agent still sees the same checkout.
 		if !task.ForceFreshSession {
 			if prior, err := h.Queries.GetLastTaskSession(r.Context(), db.GetLastTaskSessionParams{
 				AgentID: task.AgentID,
 				IssueID: task.IssueID,
 			}); err == nil && prior.SessionID.Valid {
-				if prior.RuntimeID == task.RuntimeID {
+				if !task.TriggerCommentID.Valid && prior.RuntimeID == task.RuntimeID {
 					resp.PriorSessionID = prior.SessionID.String
 				}
 				if prior.WorkDir.Valid {
@@ -1362,6 +1452,40 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 				var repos []RepoData
 				if json.Unmarshal(ws.Repos, &repos) == nil && len(repos) > 0 {
 					resp.Repos = repos
+				}
+			}
+
+			// Squad-leader briefing injection for quick-create tasks. When
+			// the user picked a squad in the modal, the task runs on the
+			// squad's leader agent (resolved by the handler). Surface the
+			// same Operating Protocol + Roster + user Instructions that
+			// issue-bound squad tasks see, so the leader can decide to
+			// delegate before opening the issue.
+			if resp.Agent != nil && qc.SquadID != "" {
+				wsUUID, wsErr := util.ParseUUID(qc.WorkspaceID)
+				squadUUID, sqErr := util.ParseUUID(qc.SquadID)
+				if wsErr == nil && sqErr == nil {
+					if squad, err := h.Queries.GetSquadInWorkspace(r.Context(), db.GetSquadInWorkspaceParams{
+						ID:          squadUUID,
+						WorkspaceID: wsUUID,
+					}); err == nil && uuidToString(squad.LeaderID) == resp.Agent.ID {
+						briefing := buildSquadLeaderBriefing(r.Context(), h.Queries, squad)
+						if strings.TrimSpace(resp.Agent.Instructions) == "" {
+							resp.Agent.Instructions = briefing
+						} else {
+							resp.Agent.Instructions = resp.Agent.Instructions + "\n\n" + briefing
+						}
+						// Surface the squad identity to the daemon so the
+						// quick-create prompt defaults the new issue's
+						// assignee to the squad, not the leader agent.
+						resp.SquadID = uuidToString(squad.ID)
+						resp.SquadName = squad.Name
+						slog.Debug("injected squad leader briefing for quick-create",
+							"squad_id", uuidToString(squad.ID),
+							"squad_name", squad.Name,
+							"leader_agent_id", resp.Agent.ID,
+						)
+					}
 				}
 			}
 		}

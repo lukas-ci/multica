@@ -62,6 +62,7 @@ describe("ApiClient", () => {
     });
     await client.updateAutopilotTrigger("ap-1", "tr-1", { enabled: false });
     await client.deleteAutopilotTrigger("ap-1", "tr-1");
+    await client.rotateAutopilotTriggerWebhookToken("ap-1", "tr-1");
 
     const calls = fetchMock.mock.calls.map(([url, init]) => ({
       url,
@@ -104,6 +105,10 @@ describe("ApiClient", () => {
         body: JSON.stringify({ enabled: false }),
       },
       { url: "https://api.example.test/api/autopilots/ap-1/triggers/tr-1", method: "DELETE" },
+      {
+        url: "https://api.example.test/api/autopilots/ap-1/triggers/tr-1/rotate-webhook-token",
+        method: "POST",
+      },
     ]);
   });
 
@@ -197,6 +202,60 @@ describe("ApiClient", () => {
       // surface a user-facing error instead of opening `undefined`.
       expect(att.id).toBe("");
       expect(att.download_url).toBe("");
+    });
+  });
+
+  describe("getAttachmentTextContent", () => {
+    it("returns body text and the original content type from the X-* header", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response("# heading\n\nbody\n", {
+            status: 200,
+            headers: {
+              "Content-Type": "text/plain; charset=utf-8",
+              "X-Original-Content-Type": "text/markdown",
+            },
+          }),
+        ),
+      );
+
+      const client = new ApiClient("https://api.example.test");
+      const { text, originalContentType } =
+        await client.getAttachmentTextContent("att-1");
+
+      expect(text).toBe("# heading\n\nbody\n");
+      expect(originalContentType).toBe("text/markdown");
+    });
+
+    it("throws PreviewTooLargeError on 413", async () => {
+      const { PreviewTooLargeError } = await import("./client");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response("", { status: 413, statusText: "Payload Too Large" }),
+        ),
+      );
+
+      const client = new ApiClient("https://api.example.test");
+      await expect(client.getAttachmentTextContent("att-1")).rejects.toBeInstanceOf(
+        PreviewTooLargeError,
+      );
+    });
+
+    it("throws PreviewUnsupportedError on 415", async () => {
+      const { PreviewUnsupportedError } = await import("./client");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response("", { status: 415, statusText: "Unsupported Media Type" }),
+        ),
+      );
+
+      const client = new ApiClient("https://api.example.test");
+      await expect(client.getAttachmentTextContent("att-1")).rejects.toBeInstanceOf(
+        PreviewUnsupportedError,
+      );
     });
   });
 
